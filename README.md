@@ -41,8 +41,8 @@ north-up.
 
 ### The track
 
-Either a CSV file, or a Garmin `.tcx` file that is calibrated on the map first (see
-[Calibration](#calibration)).
+Either a CSV file (`--csv`), for example one produced by another tool, or a Garmin `.tcx`
+file (`--tcx`) that is calibrated on the map first (see [Calibration](#calibration)).
 
 CSV columns (header names matter, order does not):
 
@@ -65,18 +65,22 @@ file uses another size, pass `--csv-width`.
 ## Usage
 
 ```sh
-# view a track that already has a CSV
-visu-course-co map.pdf track.csv
+# view a track given as a CSV (no calibration)
+visu-course-co map.pdf --csv track.csv
 
 # calibrate a .tcx on the map, write the CSV, then view it
-visu-course-co map.pdf race.tcx
+visu-course-co map.pdf --tcx race.tcx
 ```
+
+Give exactly one of `--csv` and `--tcx`.
 
 Options:
 
 | option | meaning |
 | --- | --- |
-| `--out <file>` | where to write the CSV when the input is a `.tcx` (default: `<tcx name>-legs.csv` next to it) |
+| `--csv <file>` | the track as a CSV file, shown as is |
+| `--tcx <file>` | a Garmin `.tcx` file, to calibrate on the map first |
+| `--out <file>` | with `--tcx`, where to write the CSV (default: `<tcx name>-legs.csv` next to it) |
 | `--csv-width <px>` | width in pixels of the page image the CSV coordinates refer to (default: the size of the scan in the PDF) |
 | `--render-width <px>` | width used to render the PDF when the poppler fallback is needed (default 4096) |
 
@@ -89,7 +93,7 @@ Options:
 
 ## Calibration
 
-Starting from a `.tcx` file, the app needs to know where the track is on the map. Click on
+Starting from a `.tcx` file (`--tcx`), the app needs to know where the track is on the map. Click on
 the map, in this order:
 
 1. the start triangle,

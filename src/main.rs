@@ -13,11 +13,15 @@ use std::path::PathBuf;
 struct Args {
     /// PDF file with the race map.
     pdf: PathBuf,
-    /// Either the CSV file with the track, or a Garmin .tcx file: in that case you first
-    /// click the controls on the map to calibrate, and the CSV is generated.
-    input: PathBuf,
-    /// Where to write the CSV when `input` is a .tcx file (default: next to it, `*-legs.csv`).
-    #[arg(long)]
+    /// CSV file with the track (one row per trackpoint), shown as is, without calibration.
+    #[arg(long, value_name = "FILE", conflicts_with = "tcx", required_unless_present = "tcx")]
+    csv: Option<PathBuf>,
+    /// Garmin .tcx file: you first click the controls on the map to calibrate, and a CSV is
+    /// generated.
+    #[arg(long, value_name = "FILE")]
+    tcx: Option<PathBuf>,
+    /// Where to write the CSV generated from --tcx (default: next to it, `*-legs.csv`).
+    #[arg(long, requires = "tcx")]
     out: Option<PathBuf>,
     /// Width in pixels of the page image the CSV coordinates refer to.
     /// Defaults to the size of the scan embedded in the PDF.
@@ -31,16 +35,18 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let is_tcx = args.input.extension().is_some_and(|e| e.eq_ignore_ascii_case("tcx"));
-    let (course, calib) = if is_tcx {
-        let samples = tcx::load(&args.input)?;
-        let out = args.out.clone().unwrap_or_else(|| {
-            let stem = args.input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            args.input.with_file_name(format!("{stem}-legs.csv"))
-        });
-        (model::Course::empty(), Some(app::CalibSession::new(samples, out)))
-    } else {
-        (model::Course::load(&args.input)?, None)
+    anyhow::ensure!(args.out.is_none() || args.tcx.is_some(), "--out only makes sense with --tcx");
+    let (course, calib) = match (&args.tcx, &args.csv) {
+        (Some(tcx_path), _) => {
+            let samples = tcx::load(tcx_path)?;
+            let out = args.out.clone().unwrap_or_else(|| {
+                let stem = tcx_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                tcx_path.with_file_name(format!("{stem}-legs.csv"))
+            });
+            (model::Course::empty(), Some(app::CalibSession::new(samples, out)))
+        }
+        (None, Some(csv_path)) => (model::Course::load(csv_path)?, None),
+        (None, None) => anyhow::bail!("give either --csv <file> or --tcx <file>"),
     };
     let map = pdf::load_map(&args.pdf, args.render_width)?;
     let csv_width = args
