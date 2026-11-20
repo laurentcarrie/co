@@ -95,7 +95,7 @@ Options:
 ## Calibration
 
 Starting from a `.tcx` file (`--tcx`), the app needs to know where the track is on the map.
-The side panel lists the **Start** (triangle), the controls **1, 2, 3, ...** and the **Finish**,
+The side panel lists the **Triangle** (the start), the controls **1, 2, 3, ...** and the **Finish**,
 all grey at first. Give the number of controls with `--controls <N>` (default 10), or use
 **+** / **−**.
 
@@ -111,8 +111,8 @@ are close to each other.
 2. Click its position on the map. The next point still to place is then selected.
 3. Click a row again to move that point, or **✕** to remove it.
 
-As soon as the start and the finish are placed, the route is drawn on the map, and it is
-updated every time a control is placed. With only the start and the finish it is a rough
+As soon as the triangle and the finish are placed, the route is drawn on the map, and it is
+updated every time a control is placed. With only the triangle and the finish it is a rough
 guess (the scale is not known); a few controls make it right. The side panel shows the mean
 and the worst error in metres: a large error usually means a misplaced click.
 
@@ -132,22 +132,36 @@ are used instead, and the panel says so.
 
 ### Saving
 
-When every point is placed, press **Save CSV and view**. The app finds the scale, rotation
+When every point is placed, press **Save CSV**. The app finds the scale, rotation
 and shift that put the track on your clicks, using the positions at the lap presses. The small
 GPS drift between controls is then removed, so that the track goes through every control. The
-result is saved as a CSV file and opened in the viewer. **Recalibrate** goes back to the clicks,
-which are kept, and so are the laps you ignored.
+result is saved as a CSV file, and you stay on the calibration screen. **Open viewer** then shows
+the legs (duration, length, pace, heart rate); it needs a saved CSV, and says when changes have
+not been saved yet. **Recalibrate**, in the viewer, goes back to the clicks, which are kept, and
+so are the laps you ignored.
 
-Then a window asks when you were at the triangle: a slider goes from the start of the watch to
-the moment you reached control 1. Move it to the time you were at the triangle; leg 1 is drawn
-on the map from that moment. **Done** starts leg 1 there and rewrites the CSV, **Cancel** keeps
-the automatic start: a lap pressed at the triangle if there is one, else the track point nearest
-to the triangle.
+### The triangle
+
+Two cases, chosen with the tickbox **I pressed lap at the triangle** (under the number of
+controls):
+
+- **Ticked:** the lap button was pressed at the triangle, which is then like control 0. It is
+  tied to a lap press like every control (the first one, before control 1), so the time at the
+  triangle is known and leg 1 starts at that press. The list of laps shows `→ Triangle`.
+- **Not ticked:** the triangle only marks where leg 1 begins, and you give the time yourself. Press
+  **When did I pass the triangle?**, next to **Save CSV** while calibrating (once the route is
+  drawn), or in the side panel of the viewer. A window opens with a slider from the start of the
+  watch to the moment you reached control 1. Move it to the time you were at the triangle: the
+  track point at that time is put on the triangle, and leg 1 is redrawn from there (the drift is
+  spread up to control 1). If the triangle itself is misplaced, press **Place the triangle** and
+  click its place on the map. **Done** starts leg 1 at the chosen time and writes the CSV (when
+  calibrating, it saves and stays on the calibration screen), **Cancel** keeps the automatic start,
+  the track point nearest to the triangle. The button needs a `--tcx` session.
 
 Notes:
 
-- The start triangle is not a control: it only marks where leg 1 begins. Whatever the watch
-  recorded before that moment is left out.
+- The start triangle is not a control: it marks where leg 1 begins, and the track point at that
+  moment sits on it. Whatever the watch recorded before that moment is left out.
 - The legs are not independent. The scale, rotation and shift are common to the whole map,
   and the lap presses are tied to the controls together, in order. Only the drift
   correction of a leg depends on its own two controls.

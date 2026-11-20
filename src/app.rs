@@ -27,6 +27,14 @@ pub struct CalibSession {
     /// While the user is placing themselves at the start triangle: the chosen time, in seconds
     /// since the watch start.
     placing: Option<f64>,
+    /// What is placed or ignored has changed since the last save.
+    unsaved: bool,
+    /// The lap button was pressed at the triangle: it is like control 0, tied to a lap press.
+    lap_at_triangle: bool,
+    /// While placing: the next click on the map moves the start triangle.
+    placing_triangle: bool,
+    /// The triangle was moved while placing: the saved CSV is out of date.
+    triangle_moved: bool,
 }
 
 impl CalibSession {
@@ -40,22 +48,26 @@ impl CalibSession {
             message: String::new(),
             report: None,
             placing: None,
+            unsaved: true,
+            lap_at_triangle: false,
+            placing_triangle: false,
+            triangle_moved: false,
         }
     }
 
-    /// Name of a place: "Start", "1", ..., "Finish".
+    /// Name of a place: "Triangle", "1", ..., "Finish".
     fn slot_name(&self, k: usize) -> String {
         match k {
-            0 => "Start".into(),
+            0 => "Triangle".into(),
             k if k + 1 == self.slots.len() => "Finish".into(),
             k => k.to_string(),
         }
     }
 
-    /// Short name on the map: "S", "1", ..., "F".
+    /// Short name on the map: "Tri", "1", ..., "F".
     fn slot_tag(&self, k: usize) -> String {
         match k {
-            0 => "S".into(),
+            0 => "Tri".into(),
             k if k + 1 == self.slots.len() => "F".into(),
             k => k.to_string(),
         }
@@ -76,21 +88,30 @@ impl CalibSession {
         }
     }
 
-    /// Fits the track to what is placed, to show the route. Needs the triangle and the finish.
+    /// Fits the track to what is placed, to show the route. Closes the placement of the triangle.
     fn refresh_preview(&mut self, csv_to_page: f64) {
         self.placing = None;
+        self.placing_triangle = false;
+        self.fit_preview(csv_to_page);
+    }
+
+    /// Fits the track to what is placed, without leaving the placement of the triangle.
+    fn fit_preview(&mut self, csv_to_page: f64) {
+        self.unsaved = true;
         if self.slots[0].is_none() || self.slots[self.slots.len() - 1].is_none() {
             self.report = None;
             self.message.clear();
             return;
         }
-        match calib::calibrate(&self.samples, &self.slots, csv_to_page, None, &self.ignored_laps, None) {
+        match calib::calibrate(&self.samples, &self.slots, csv_to_page, None, self.lap_at_triangle, &self.ignored_laps, None) {
             Ok(r) => {
                 self.report = Some(r);
                 self.message.clear();
             }
             Err(e) => {
-                self.report = None;
+                if self.placing.is_none() {
+                    self.report = None;
+                }
                 self.message = format!("Error: {e:#}");
             }
         }
@@ -189,30 +210,52 @@ impl App {
         }
     }
 
-    /// Writes the CSV and switches to the viewer. `start_sample` is the sample where the user passed
-    /// the triangle, once they have said so: until then the placement window opens.
+    /// Writes the CSV and loads it. Stays on the same screen. `start_sample` is the sample where the user passed
+    /// the triangle, if they said so (see `open_start_window`).
     fn run_calibration(&mut self, start_sample: Option<usize>) {
         let Some(cal) = self.calib.as_mut() else { return };
         let csv_to_page = self.csv_to_page as f64;
-        match calib::calibrate(&cal.samples, &cal.slots, csv_to_page, start_sample, &cal.ignored_laps, Some(&cal.out))
+        match calib::calibrate(&cal.samples, &cal.slots, csv_to_page, start_sample, cal.lap_at_triangle, &cal.ignored_laps, Some(&cal.out))
             .and_then(|r| Course::load(&cal.out).map(|c| (r, c)))
         {
             Ok((report, course)) => {
                 cal.message = format!("Saved {}", cal.out.display());
-                cal.placing = (start_sample.is_none() && report.before_first_control().len() >= 2)
-                    .then(|| report.track[report.start_idx].t);
-                if cal.placing.is_some() {
-                    self.pending_fit = Some(0);
-                }
+                cal.placing = None;
+                cal.placing_triangle = false;
+                cal.triangle_moved = false;
                 cal.report = Some(report);
+                cal.unsaved = false;
                 self.speed_range = course.range(|p| (p.speed > 0.3).then_some(p.speed));
                 self.hr_range = course.range(|p| p.hr);
                 self.course = course;
-                self.selection = Selection::All;
-                self.calibrating = false;
-                self.fitted = false;
+                if !self.calibrating {
+                    self.selection = Selection::All;
+                    self.fitted = false;
+                }
             }
             Err(e) => cal.message = format!("Error: {e:#}"),
+        }
+    }
+
+    /// Leaves the calibration for the viewer, on the last saved CSV.
+    fn open_viewer(&mut self) {
+        if self.course.legs.is_empty() {
+            return;
+        }
+        self.calibrating = false;
+        self.selection = Selection::All;
+        self.fitted = false;
+    }
+
+    /// Opens the window where the user says when they passed the start triangle.
+    fn open_start_window(&mut self) {
+        let Some(cal) = self.calib.as_mut() else { return };
+        let Some(report) = cal.report.as_ref().filter(|r| r.before_first_control().len() >= 2) else { return };
+        cal.placing = Some(report.track[report.start_idx].t);
+        cal.placing_triangle = false;
+        cal.triangle_moved = false;
+        if !self.course.legs.is_empty() {
+            self.pending_fit = Some(0);
         }
     }
 
@@ -220,7 +263,43 @@ impl App {
         let csv_to_page = self.csv_to_page as f64;
         let Some(cal) = self.calib.as_mut() else { return };
         ui.heading("Calibration");
-        ui.label("Click a row, then click its place on the map. The route is drawn once the start and the finish are placed, and updated with each control.");
+        ui.label("Click a row, then click its place on the map. The route is drawn once the triangle and the finish are placed, and updated with each control.");
+        ui.separator();
+        // What to do next, and the buttons: at the top, so that they are always in view.
+        let (mut save, mut open_window) = (false, false);
+        match &cal.selected {
+            Some(k) => ui.label(egui::RichText::new(format!("Click on the map to place: {}", cal.slot_name(*k))).strong()),
+            None => ui.label("Click a row to place or move a point."),
+        };
+        if let Some(r) = &cal.report {
+            ui.label(format!("Error: mean {:.0} m, max {:.0} m", r.mean_err_m, r.max_err_m));
+        }
+        if !cal.message.is_empty() {
+            ui.label(&cal.message);
+        }
+        let has_course = !self.course.legs.is_empty();
+        let mut open_viewer = false;
+        ui.horizontal(|ui| {
+            let all = cal.slots.iter().all(Option::is_some);
+            save = ui
+                .add_enabled(all, egui::Button::new("Save CSV"))
+                .on_disabled_hover_text("Place every point first")
+                .clicked();
+            open_viewer = ui
+                .add_enabled(has_course, egui::Button::new("Open viewer"))
+                .on_hover_text("Look at the legs: duration, length, pace, heart rate")
+                .on_disabled_hover_text("Save the CSV first")
+                .clicked();
+        });
+        if has_course && cal.unsaved {
+            ui.label("Changes not saved yet: the viewer shows the last saved CSV.");
+        }
+        let known = cal.report.as_ref().is_some_and(|r| r.start_from_lap);
+        let can_place = cal.placing.is_none() && !known && cal.report.as_ref().is_some_and(|r| r.before_first_control().len() >= 2);
+        let why_not = if known { "The lap was pressed at the triangle: the time is known" } else { "Place the triangle and the finish first" };
+        if ui.add_enabled(can_place, egui::Button::new("When did I pass the triangle?")).on_disabled_hover_text(why_not).clicked() {
+            open_window = true;
+        }
         ui.separator();
         let mut changed = false;
         ui.horizontal(|ui| {
@@ -235,6 +314,13 @@ impl App {
                 changed = true;
             }
         });
+        if ui
+            .checkbox(&mut cal.lap_at_triangle, "I pressed lap at the triangle")
+            .on_hover_text("The triangle is then like control 0: tied to a lap press, so the time at the triangle is known.")
+            .changed()
+        {
+            changed = true;
+        }
         let mut clear = None;
         egui::ScrollArea::vertical().id_salt("slots").max_height((ui.available_height() * 0.42).max(120.0)).show(ui, |ui| {
             egui::Grid::new("slots").num_columns(3).striped(true).show(ui, |ui| {
@@ -297,26 +383,12 @@ impl App {
             }
             cal.refresh_preview(csv_to_page);
         }
-        ui.separator();
-        match &cal.selected {
-            Some(k) => ui.label(egui::RichText::new(format!("Click on the map to place: {}", cal.slot_name(*k))).strong()),
-            None => ui.label("Click a row to place or move a point."),
-        };
-        if let Some(r) = &cal.report {
-            ui.label(format!("Error: mean {:.0} m, max {:.0} m", r.mean_err_m, r.max_err_m));
-        }
-        if !cal.message.is_empty() {
-            ui.label(&cal.message);
-        }
-        let all = cal.slots.iter().all(Option::is_some);
-        let compute = ui
-            .add_enabled(all, egui::Button::new("Save CSV and view"))
-            .on_disabled_hover_text("Place every point first");
-        if compute.clicked() {
+        if save {
             self.run_calibration(None);
-        }
-        if self.course.legs.len() > 0 && ui.button("Back to viewer").clicked() {
-            self.calibrating = false;
+        } else if open_window {
+            self.open_start_window();
+        } else if open_viewer {
+            self.open_viewer();
         }
     }
 
@@ -411,6 +483,16 @@ impl App {
                     ui.label(format!("Worst control: {l} ({e:.0} m)"));
                 }
             }
+            let can_place = self.calib.as_ref().is_some_and(|c| {
+                c.placing.is_none() && c.report.as_ref().is_some_and(|r| !r.start_from_lap && r.before_first_control().len() >= 2)
+            });
+            if ui
+                .add_enabled(can_place, egui::Button::new("When did I pass the triangle?"))
+                .on_disabled_hover_text("Not available when the lap was pressed at the triangle: the time is known")
+                .clicked()
+            {
+                self.open_start_window();
+            }
             if ui.button("Recalibrate").clicked() {
                 self.calibrating = true;
                 if let Some(cal) = self.calib.as_mut() {
@@ -501,12 +583,14 @@ impl App {
         let (Some(first), Some(last)) = (before.first(), before.last()) else { return };
         let (t0, t1) = (first.t, last.t);
         let (mut done, mut cancel) = (false, false);
+        let mut armed = cal.placing_triangle;
+        let message = if cal.message.starts_with("Error") { cal.message.clone() } else { String::new() };
         egui::Window::new("When did you pass the start triangle?")
             .anchor(egui::Align2::CENTER_TOP, [0.0, 10.0])
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label("Move the slider to the moment you were at the triangle: leg 1 is drawn from there.");
+                ui.label("Move the slider to the moment you were at the triangle: the track point at that time is put on the triangle, and leg 1 is drawn from there.");
                 ui.spacing_mut().slider_width = 420.0;
                 ui.add(
                     egui::Slider::new(&mut t, t0..=t1)
@@ -515,17 +599,34 @@ impl App {
                 );
                 ui.label(format!("Triangle at {} after the watch start; leg 1 lasts {}.", fmt_dur(t - t0), fmt_dur(t1 - t)));
                 ui.horizontal(|ui| {
+                    if ui.selectable_label(armed, "Place the triangle").on_hover_text("Then click its place on the map").clicked() {
+                        armed = !armed;
+                    }
+                    if armed {
+                        ui.label(egui::RichText::new("Click on the map").strong());
+                    }
+                });
+                if !message.is_empty() {
+                    ui.label(&message);
+                }
+                ui.horizontal(|ui| {
                     done = ui.button("Done").clicked();
                     cancel = ui.button("Cancel").clicked();
                 });
             });
         cal.placing = Some(t);
+        cal.placing_triangle = armed;
         if done {
             // Last GPS point at or before the chosen time.
             let sample = before.iter().rev().find(|p| p.t <= t).map(|p| p.sample);
             self.run_calibration(sample);
         } else if cancel {
             cal.placing = None;
+            cal.placing_triangle = false;
+            if cal.triangle_moved && !self.calibrating {
+                // The triangle moved: save again, with the automatic start.
+                self.run_calibration(None);
+            }
         }
     }
 
@@ -574,6 +675,57 @@ impl App {
         }
     }
 
+    /// While the user is choosing when they passed the start triangle: a click on the map can move the
+    /// triangle, and leg 1 is drawn from the chosen time. Returns whether it drew (nothing otherwise).
+    fn placement_view(&mut self, resp: &egui::Response, painter: &egui::Painter, rect: Rect) -> bool {
+        if !self.placing_start() {
+            return false;
+        }
+        // While placing the start triangle, the next click on the map moves it.
+        if resp.clicked() {
+            let (offset, zoom, page_size, csv_to_page) = (self.offset, self.zoom, self.page_size, self.csv_to_page as f64);
+            if let (Some(pos), Some(cal)) = (resp.interact_pointer_pos(), self.calib.as_mut()) {
+                let p = (pos - rect.min - offset) / zoom;
+                if cal.placing.is_some() && cal.placing_triangle && p.x >= 0.0 && p.y >= 0.0 && p.x <= page_size.x && p.y <= page_size.y {
+                    cal.slots[0] = Some((p.x as f64, p.y as f64));
+                    cal.placing_triangle = false;
+                    cal.triangle_moved = true;
+                    cal.fit_preview(csv_to_page);
+                }
+            }
+        }
+
+        if let Some(cal) = &self.calib {
+            if let (Some(t), Some(report)) = (cal.placing, &cal.report) {
+                let pts = report.before_first_control();
+                let screen = |p: (f64, f64)| rect.min + self.offset + Vec2::new(p.0 as f32, p.1 as f32) * self.zoom;
+                // The track point at the chosen time is put on the triangle, and the drift is spread
+                // up to control 1, as it will be in the saved file.
+                let last = pts.len() - 1;
+                let k = pts.partition_point(|p| p.t <= t).saturating_sub(1).min(last.saturating_sub(1));
+                let tri = cal.slots[0].unwrap_or(pts[k].page);
+                let o_start = (tri.0 - pts[k].raw.0, tri.1 - pts[k].raw.1);
+                let o_c1 = (pts[last].page.0 - pts[last].raw.0, pts[last].page.1 - pts[last].raw.1);
+                let placed = |j: usize| {
+                    let f = if j <= k { 0.0 } else { (j - k) as f64 / (last - k).max(1) as f64 };
+                    (pts[j].raw.0 + o_start.0 + (o_c1.0 - o_start.0) * f, pts[j].raw.1 + o_start.1 + (o_c1.1 - o_start.1) * f)
+                };
+                // The whole track before control 1, faint; leg 1 from the chosen time, strong.
+                let all: Vec<Pos2> = (0..pts.len()).map(|j| screen(placed(j))).collect();
+                painter.add(egui::Shape::line(all, Stroke::new(1.5, Color32::from_gray(150))));
+                let line: Vec<Pos2> = (k..=last).map(|j| screen(placed(j))).collect();
+                painter.add(egui::Shape::line(line, Stroke::new(3.5, Self::leg_color(0))));
+                let p = screen(tri);
+                painter.circle_filled(p, 4.0, Color32::from_rgb(200, 0, 200));
+                painter.text(p + Vec2::new(8.0, -8.0), egui::Align2::LEFT_BOTTOM, "Tri", egui::FontId::proportional(16.0), Color32::from_rgb(120, 0, 160));
+                painter.circle_filled(p, 7.0, Color32::BLACK);
+                painter.circle_filled(p, 5.0, Color32::from_rgb(255, 230, 0));
+                return true;
+            }
+        }
+        false
+    }
+
     /// Places the selected point where the map is clicked, and draws the placed points and the route.
     fn calibration_overlay(&mut self, resp: &egui::Response, painter: &egui::Painter, rect: Rect) {
         let csv_to_page = self.csv_to_page as f64;
@@ -592,6 +744,9 @@ impl App {
         let screen = |c: Click| rect.min + offset + Vec2::new(c.0 as f32, c.1 as f32) * zoom;
         // The route, from the start of leg 1 to the last placed point, one colour per leg.
         if let Some(r) = &cal.report {
+            // The whole recording, faint, including what is before the triangle and after the finish.
+            let all: Vec<Pos2> = r.track.iter().map(|p| screen(p.page)).collect();
+            painter.add(egui::Shape::line(all, Stroke::new(1.5, Color32::from_rgba_unmultiplied(110, 110, 110, 150))));
             let mut from = r.start_idx;
             for &(slot, to) in &r.visits {
                 let line: Vec<Pos2> = r.track[from..=to].iter().map(|p| screen(p.page)).collect();
@@ -682,7 +837,9 @@ impl App {
         }
 
         if self.calibrating {
-            self.calibration_overlay(&resp, &painter, rect);
+            if !self.placement_view(&resp, &painter, rect) {
+                self.calibration_overlay(&resp, &painter, rect);
+            }
             return;
         }
 
@@ -719,32 +876,8 @@ impl App {
             }
         }
 
-        if let Some(cal) = &self.calib {
-            if let (Some(t), Some(report)) = (cal.placing, &cal.report) {
-                let pts = report.before_first_control();
-                let screen = |p: (f64, f64)| rect.min + self.offset + Vec2::new(p.0 as f32, p.1 as f32) * self.zoom;
-                // The whole track before control 1, faint; leg 1 from the chosen time, strong.
-                let all: Vec<Pos2> = pts.iter().map(|p| screen(p.page)).collect();
-                painter.add(egui::Shape::line(all, Stroke::new(1.5, Color32::from_gray(150))));
-                let k = pts.partition_point(|p| p.t <= t).saturating_sub(1).min(pts.len() - 1);
-                let mut at = pts[k].page;
-                if let Some(next) = pts.get(k + 1).filter(|n| n.t > pts[k].t) {
-                    let f = ((t - pts[k].t) / (next.t - pts[k].t)).clamp(0.0, 1.0);
-                    at = (at.0 + (next.page.0 - at.0) * f, at.1 + (next.page.1 - at.1) * f);
-                }
-                let mut line = vec![screen(at)];
-                line.extend(pts[k + 1..].iter().map(|p| screen(p.page)));
-                painter.add(egui::Shape::line(line, Stroke::new(3.5, Self::leg_color(0))));
-                if let Some(c) = cal.slots[0] {
-                    let p = screen(c);
-                    painter.circle_filled(p, 4.0, Color32::from_rgb(200, 0, 200));
-                    painter.text(p + Vec2::new(8.0, -8.0), egui::Align2::LEFT_BOTTOM, "S", egui::FontId::proportional(16.0), Color32::from_rgb(120, 0, 160));
-                }
-                let c = screen(at);
-                painter.circle_filled(c, 7.0, Color32::BLACK);
-                painter.circle_filled(c, 5.0, Color32::from_rgb(255, 230, 0));
-                return;
-            }
+        if self.placement_view(&resp, &painter, rect) {
+            return;
         }
 
         if let Selection::Leg(i) = self.selection {

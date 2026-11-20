@@ -453,7 +453,7 @@ pub fn detect(page: &PageImage, n_controls: usize) -> Detection {
     det.note = format!(
         "Auto-placement: {} controls and the finish found{}; check the order and move what is wrong.",
         n_controls,
-        if start.is_some() { ", and the start" } else { " (start not found)" },
+        if start.is_some() { ", and the triangle" } else { " (triangle not found)" },
     );
     det.slots = slots;
     det
@@ -484,7 +484,7 @@ mod tests {
         if let Ok(tcx) = std::env::var("VCC_TCX") {
             // Does the detected placement give a good fit of the track?
             let samples = crate::tcx::load(std::path::Path::new(&tcx)).unwrap();
-            let r = crate::calib::calibrate(&samples, &det.slots, 1.0, None, &[], None).unwrap();
+            let r = crate::calib::calibrate(&samples, &det.slots, 1.0, None, false, &[], None).unwrap();
             println!("fit: mean {:.1} m, max {:.1} m", r.mean_err_m, r.max_err_m);
             for (l, e) in &r.errors_m {
                 println!("  {l}: {e:.1} m");

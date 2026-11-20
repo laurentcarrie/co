@@ -188,8 +188,10 @@ pub struct TrackPoint {
     pub sample: usize,
     /// Seconds since the first sample.
     pub t: f64,
-    /// Fitted position, in page pixels.
+    /// Fitted position, in page pixels, with the drift removed.
     pub page: V,
+    /// Position given by the fit alone, in page pixels, before the drift is removed.
+    pub raw: V,
 }
 
 /// A lap press of the watch (or its stop at the end), placed on the map.
@@ -202,6 +204,8 @@ pub struct LapMark {
     pub t: f64,
     /// Fitted position, in page pixels.
     pub page: V,
+    /// Index into `Report::track` of the GPS point of this press.
+    pub track_idx: usize,
     /// The control (slot) whose visit this is.
     pub slot: Option<usize>,
     /// The user does not want this one.
@@ -229,6 +233,8 @@ pub struct Report {
     /// The controls are tied to lap presses. Otherwise the file has too few of them, and each
     /// control is tied to the nearest track point.
     pub lap_based: bool,
+    /// The triangle is tied to a lap press, like control 0: the time at the triangle is known.
+    pub start_from_lap: bool,
 }
 
 impl Report {
@@ -247,6 +253,9 @@ fn label(j: usize, n_ctrl: usize) -> String {
 /// Fits the track to `slots` (page pixels: start triangle, controls, finish; `None` for a point
 /// not placed yet). The triangle and the finish are required, the controls are optional.
 ///
+/// With `lap_at_triangle`, the lap button was pressed at the triangle: it is then like control 0, tied
+/// to a lap press, and `start_sample` is not needed.
+///
 /// A control is visited when the lap button was pressed: every leg ends at a lap press. The app
 /// picks, in order, the lap presses that best match the controls; the others (pressed by mistake)
 /// are unused. `ignored_laps` lists lap numbers the user does not want at all. A runner may pass
@@ -261,6 +270,7 @@ pub fn calibrate(
     slots: &[Option<V>],
     csv_to_page: f64,
     start_sample: Option<usize>,
+    lap_at_triangle: bool,
     ignored_laps: &[usize],
     out: Option<&Path>,
 ) -> Result<Report> {
@@ -313,64 +323,70 @@ pub fn calibrate(
     }
     let kept: Vec<&Bound> = bounds.iter().filter(|b| !ignored_laps.contains(&b.id)).collect();
 
-    // Tie every control to a lap press, in order, and fit the transform on those exact points.
-    let (sim, visit, used): (Sim, Vec<usize>, Option<Vec<usize>>) = if kept.len() >= ctrl.len() {
+    // Tie every control (and the triangle, if the lap was pressed there) to a lap press, in order,
+    // and fit the transform on those exact points.
+    let lap_clicks = if lap_at_triangle { &clicks[..] } else { ctrl };
+    let (sim, visit, used): (Sim, Vec<usize>, Option<Vec<usize>>) = if kept.len() >= lap_clicks.len() {
         let bpts: Vec<V> = kept.iter().map(|b| pts[b.j]).collect();
-        let (sim, used) = if ctrl.len() >= 2 {
+        let (sim, used) = if lap_clicks.len() >= 2 {
             // From the first guess, and from scratch (there are few lap presses, so it is cheap):
             // the best fit wins.
-            let s = refine(first.sim, &bpts, ctrl)
+            let s = refine(first.sim, &bpts, lap_clicks)
                 .into_iter()
-                .chain(solve(&bpts, ctrl).ok())
+                .chain(solve(&bpts, lap_clicks).ok())
                 .min_by(|a, b| a.rms.total_cmp(&b.rms))
                 .context("cannot fit the lap presses to the controls")?;
-            let s = polish(s, &bpts, ctrl);
+            let s = polish(s, &bpts, lap_clicks);
             (s.sim, s.visit)
         } else {
-            (first.sim, assign(&first.sim, &bpts, ctrl))
+            (first.sim, assign(&first.sim, &bpts, lap_clicks))
         };
-        let visit = used.iter().map(|&k| kept[k].j).collect();
-        (sim, visit, Some(used))
+        (sim, used.iter().map(|&k| kept[k].j).collect(), Some(used))
     } else {
-        (first.sim, first.visit[1..].to_vec(), None)
+        (first.sim, first.visit.clone(), None)
+    };
+    let start_from_lap = lap_at_triangle && used.is_some();
+    // `visit` holds the triangle too when it is tied to a lap press, or when the first guess is used.
+    let (tri_visit, visit): (Option<usize>, Vec<usize>) = match (start_from_lap, used.is_some()) {
+        (true, _) => (Some(visit[0]), visit[1..].to_vec()),
+        (false, true) => (None, visit),
+        (false, false) => (None, visit[1..].to_vec()),
     };
     let scale = sim.scale();
 
-    // Leg 1 begins where the user said. Else at a lap pressed at the triangle (an unused one just
-    // before control 1, close to the triangle), else at the track point nearest to the triangle.
+    // Leg 1 begins at the lap press at the triangle if there is one, else where the user said, else at
+    // the track point nearest to the triangle.
     let dist_to_start_m = |j: usize| d2(sim.apply(pts[j]), start).sqrt() / scale;
-    let start_j = start_sample
-        .map(|s| gps_at(s).min(visit[0].saturating_sub(1)))
-        .or_else(|| {
-            let k = used.as_ref()?[0];
-            kept[..k].iter().rev().map(|b| b.j).find(|&j| j < visit[0] && dist_to_start_m(j) < 50.0)
-        })
+    let start_j = tri_visit
+        .or_else(|| start_sample.map(|s| gps_at(s).min(visit[0].saturating_sub(1))))
         .unwrap_or_else(|| {
             (0..visit[0].max(1))
                 .min_by(|&a, &b| dist_to_start_m(a).total_cmp(&dist_to_start_m(b)))
                 .unwrap_or(0)
         });
 
-    // Constant offsets at each clicked control and the finish, interpolated in between to cancel GPS
-    // drift.
-    let off: Vec<V> = visit
-        .iter()
-        .zip(ctrl)
-        .map(|(&i, &c)| {
-            let p = sim.apply(pts[i]);
-            (c.0 - p.0, c.1 - p.1)
-        })
-        .collect();
+    // Offsets that put the track on the triangle (at the start of leg 1), on every control and on
+    // the finish, interpolated in between to cancel GPS drift.
+    let offset_to = |i: usize, c: V| {
+        let p = sim.apply(pts[i]);
+        (c.0 - p.0, c.1 - p.1)
+    };
+    let mut fidx = vec![start_j];
+    let mut foff = vec![offset_to(start_j, start)];
+    for (&i, &c) in visit.iter().zip(ctrl) {
+        fidx.push(i);
+        foff.push(offset_to(i, c));
+    }
     let offset_at = |i: usize| -> V {
-        if i <= visit[0] {
-            return off[0];
+        if i <= fidx[0] {
+            return foff[0];
         }
-        if i >= visit[visit.len() - 1] {
-            return off[off.len() - 1];
+        if i >= fidx[fidx.len() - 1] {
+            return foff[foff.len() - 1];
         }
-        let c = visit.partition_point(|&x| x <= i) - 1;
-        let f = (i - visit[c]) as f64 / (visit[c + 1] - visit[c]).max(1) as f64;
-        (off[c].0 + (off[c + 1].0 - off[c].0) * f, off[c].1 + (off[c + 1].1 - off[c].1) * f)
+        let c = fidx.partition_point(|&x| x <= i) - 1;
+        let f = (i - fidx[c]) as f64 / (fidx[c + 1] - fidx[c]).max(1) as f64;
+        (foff[c].0 + (foff[c + 1].0 - foff[c].0) * f, foff[c].1 + (foff[c + 1].1 - foff[c].1) * f)
     };
     let page_of = |j: usize| -> V {
         let (p, o) = (sim.apply(pts[j]), offset_at(j));
@@ -427,8 +443,10 @@ pub fn calibrate(
         .iter()
         .map(|b| {
             let kept_idx = kept.iter().position(|k| k.id == b.id);
-            let slot = kept_idx.zip(used.as_ref()).and_then(|(k, u)| u.iter().position(|&x| x == k)).map(|pos| placed[1 + pos].0);
-            LapMark { id: b.id, is_stop: b.is_stop, t: b.t, page: page_of(b.j), slot, ignored: kept_idx.is_none() }
+            // `used` is in the order of `lap_clicks`: from the triangle if it is tied to a lap press.
+            let first_slot = usize::from(!start_from_lap);
+            let slot = kept_idx.zip(used.as_ref()).and_then(|(k, u)| u.iter().position(|&x| x == k)).map(|pos| placed[first_slot + pos].0);
+            LapMark { id: b.id, is_stop: b.is_stop, t: b.t, page: page_of(b.j), track_idx: b.j, slot, ignored: kept_idx.is_none() }
         })
         .collect();
     Ok(Report {
@@ -438,11 +456,12 @@ pub fn calibrate(
         max_err_m,
         start_gap_m,
         rows: samples.len(),
-        track: (0..gps.len()).map(|j| TrackPoint { sample: gps[j], t: samples[gps[j]].t, page: page_of(j) }).collect(),
+        track: (0..gps.len()).map(|j| TrackPoint { sample: gps[j], t: samples[gps[j]].t, page: page_of(j), raw: sim.apply(pts[j]) }).collect(),
         start_idx: start_j,
         visits: placed[1..].iter().zip(visit).map(|(&(slot, _), j)| (slot, j)).collect(),
         laps,
         lap_based: used.is_some(),
+        start_from_lap,
     })
 }
 
@@ -483,12 +502,12 @@ mod tests {
         let (samples, clicks) = l_track(&[]);
         let clicks: Vec<Option<V>> = clicks.into_iter().map(Some).collect();
         let out = std::env::temp_dir().join("vcc-start-test.csv");
-        let auto = calibrate(&samples, &clicks, 1.0, None, &[], Some(&out)).unwrap();
+        let auto = calibrate(&samples, &clicks, 1.0, None, false, &[], Some(&out)).unwrap();
         let before = auto.before_first_control();
         assert!(before.len() > 2);
         assert_eq!(before[0].sample, 0);
         assert!(before.last().unwrap().t > 10.0);
-        let chosen = calibrate(&samples, &clicks, 1.0, Some(10), &[], Some(&out)).unwrap();
+        let chosen = calibrate(&samples, &clicks, 1.0, Some(10), false, &[], Some(&out)).unwrap();
         assert_eq!(chosen.track[chosen.start_idx].sample, 10);
         // The fit does not depend on the start of leg 1.
         assert!((chosen.mean_err_m - auto.mean_err_m).abs() < 1e-9);
@@ -503,16 +522,16 @@ mod tests {
         let mut slots: Vec<Option<V>> = clicks.into_iter().map(Some).collect();
         slots[2] = None;
         slots[3] = None;
-        let r = calibrate(&samples, &slots, 1.0, None, &[], None).unwrap();
+        let r = calibrate(&samples, &slots, 1.0, None, false, &[], None).unwrap();
         assert_eq!(r.visits.iter().map(|v| v.0).collect::<Vec<_>>(), [1, 4]);
         // Only the triangle and the finish: a (rough) route is still drawn.
         slots[1] = None;
-        assert!(calibrate(&samples, &slots, 1.0, None, &[], None).is_ok());
+        assert!(calibrate(&samples, &slots, 1.0, None, false, &[], None).is_ok());
         // Writing the CSV needs every point.
-        assert!(calibrate(&samples, &slots, 1.0, None, &[], Some(&std::env::temp_dir().join("vcc-x.csv"))).is_err());
+        assert!(calibrate(&samples, &slots, 1.0, None, false, &[], Some(&std::env::temp_dir().join("vcc-x.csv"))).is_err());
         // The triangle and the finish are required.
         slots[0] = None;
-        assert!(calibrate(&samples, &slots, 1.0, None, &[], None).is_err());
+        assert!(calibrate(&samples, &slots, 1.0, None, false, &[], None).is_err());
     }
 
     #[test]
@@ -523,7 +542,7 @@ mod tests {
         let (samples, clicks) = l_track(&[20, 40, 50, 60, 75, 95]);
         let slots: Vec<Option<V>> = clicks.into_iter().map(Some).collect();
         let out = std::env::temp_dir().join("vcc-laps-test.csv");
-        let r = calibrate(&samples, &slots, 1.0, None, &[], Some(&out)).unwrap();
+        let r = calibrate(&samples, &slots, 1.0, None, false, &[], Some(&out)).unwrap();
         assert!(r.lap_based);
         let visits: Vec<usize> = r.visits.iter().map(|v| r.track[v.1].sample).collect();
         assert_eq!(visits, [40, 50, 75, 95]);
@@ -533,8 +552,17 @@ mod tests {
         assert_eq!(slot_of(3), None);
         // The press at the triangle gives the start of leg 1.
         assert_eq!(r.track[r.start_idx].sample, 20);
+        assert!(!r.start_from_lap);
+        // With the lap pressed at the triangle, it is like control 0: tied to the press at 20.
+        let r = calibrate(&samples, &slots, 1.0, None, true, &[], None).unwrap();
+        assert!(r.start_from_lap);
+        assert_eq!(r.track[r.start_idx].sample, 20);
+        assert_eq!(r.visits.iter().map(|v| r.track[v.1].sample).collect::<Vec<_>>(), [40, 50, 75, 95]);
+        let slot_of = |id: usize| r.laps.iter().find(|l| l.id == id).unwrap().slot;
+        assert_eq!([slot_of(0), slot_of(1), slot_of(2), slot_of(4), slot_of(5)], [Some(0), Some(1), Some(2), Some(3), Some(4)]);
+        assert_eq!(slot_of(3), None);
         // Ignoring a lap takes it out.
-        let r = calibrate(&samples, &slots, 1.0, None, &[3], None).unwrap();
+        let r = calibrate(&samples, &slots, 1.0, None, false, &[3], None).unwrap();
         assert!(r.laps.iter().find(|l| l.id == 3).unwrap().ignored);
         assert_eq!(r.visits.iter().map(|v| r.track[v.1].sample).collect::<Vec<_>>(), [40, 50, 75, 95]);
     }
@@ -550,18 +578,36 @@ mod tests {
         samples[30].lat_lon = Some((la + 1e-7, lo + 1e-7));
         samples[40].lat_lon = Some((la + 4e-5, lo + 4e-5)); // a few metres away at the press
         let slots: Vec<Option<V>> = clicks.into_iter().map(Some).collect();
-        let r = calibrate(&samples, &slots, 1.0, None, &[], None).unwrap();
+        let r = calibrate(&samples, &slots, 1.0, None, false, &[], None).unwrap();
         assert!(r.lap_based);
         assert_eq!(r.track[r.visits[0].1].sample, 40);
+    }
+
+    #[test]
+    fn start_of_leg_1_is_on_the_triangle() {
+        let (samples, clicks) = l_track(&[]);
+        let slots: Vec<Option<V>> = clicks.into_iter().map(Some).collect();
+        for chosen in [None, Some(10), Some(30)] {
+            let r = calibrate(&samples, &slots, 1.0, chosen, false, &[], None).unwrap();
+            let (p, s) = (r.track[r.start_idx].page, slots[0].unwrap());
+            assert!((p.0 - s.0).hypot(p.1 - s.1) < 1e-6, "start at {p:?}, triangle at {s:?}");
+            // ... and the first control stays on its click.
+            let c1 = r.track[r.visits[0].1].page;
+            let k = slots[1].unwrap();
+            assert!((c1.0 - k.0).hypot(c1.1 - k.1) < 1e-6);
+        }
     }
 
     #[test]
     fn too_few_laps_falls_back_to_nearest_points() {
         let (samples, clicks) = l_track(&[]);
         let slots: Vec<Option<V>> = clicks.into_iter().map(Some).collect();
-        let r = calibrate(&samples, &slots, 1.0, None, &[], None).unwrap();
+        let r = calibrate(&samples, &slots, 1.0, None, false, &[], None).unwrap();
         assert!(!r.lap_based);
         assert!(r.laps.iter().all(|l| l.slot.is_none()));
+        // Not enough laps for the triangle either: the nearest points are used.
+        let r = calibrate(&samples, &slots, 1.0, None, true, &[], None).unwrap();
+        assert!(!r.lap_based && !r.start_from_lap);
     }
 
     /// Local check against a real race. Run with:
@@ -580,7 +626,7 @@ mod tests {
             .collect();
         let samples = crate::tcx::load(Path::new(&tcx)).unwrap();
         let out = std::env::temp_dir().join("vcc-test.csv");
-        let r = calibrate(&samples, &clicks, 1.0, None, &[], Some(&out)).unwrap();
+        let r = calibrate(&samples, &clicks, 1.0, None, false, &[], Some(&out)).unwrap();
         println!("scale {:.3} px/m, mean {:.1} m, max {:.1} m", r.scale_px_per_m, r.mean_err_m, r.max_err_m);
         for (l, e) in &r.errors_m {
             println!("  {l}: {e:.1} m");
