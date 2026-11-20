@@ -80,6 +80,7 @@ Options:
 | --- | --- |
 | `--csv <file>` | the track as a CSV file, shown as is |
 | `--tcx <file>` | a Garmin `.tcx` file, to calibrate on the map first |
+| `--controls <N>` | with `--tcx`, the number of controls of the course, the finish not included (default 10) |
 | `--out <file>` | with `--tcx`, where to write the CSV (default: `<tcx name>-legs.csv` next to it) |
 | `--csv-width <px>` | width in pixels of the page image the CSV coordinates refer to (default: the size of the scan in the PDF) |
 | `--render-width <px>` | width used to render the PDF when the poppler fallback is needed (default 4096) |
@@ -93,29 +94,43 @@ Options:
 
 ## Calibration
 
-Starting from a `.tcx` file (`--tcx`), the app needs to know where the track is on the map. Click on
-the map, in this order:
+Starting from a `.tcx` file (`--tcx`), the app needs to know where the track is on the map.
+The side panel lists the **Start** (triangle), the controls **1, 2, 3, ...** and the **Finish**,
+all grey at first. Give the number of controls with `--controls <N>` (default 10), or use
+**+** / **−**.
 
-1. the start triangle,
-2. control 1, 2, 3, ...,
-3. the finish.
+At start the app looks for the course printed on the map (pink or purple circles, the double
+circle of the finish, the lines between them and the start triangle) and fills the list with a
+first guess: the route is already drawn. Check each point and correct what is wrong, as below.
+The note under the list says what was found. The detection needs `--controls` to be right, and
+a legible overprint; if it cannot find everything, nothing is placed and you click the points
+yourself. The order comes from the lines between the circles, so check it where two circles
+are close to each other.
 
-Then press **Compute**. The app finds the scale, rotation and shift that put the track on
-your clicks, and works out when you reached each control, so you do not have to mark the
-time of each control. The small GPS drift between controls is then removed, so that the
-track goes through every control. The result is saved as a CSV file and opened in the
-viewer. After computing, the side panel shows the mean and the worst error in metres:
-a large error usually means a misplaced click. **Recalibrate** goes back to the clicks.
+1. Click a row of the list: it is the point you are about to place.
+2. Click its position on the map. The next point still to place is then selected.
+3. Click a row again to move that point, or **✕** to remove it.
+
+As soon as the start and the finish are placed, the route is drawn on the map, and it is
+updated every time a control is placed. With only the start and the finish it is a rough
+guess (the scale is not known); a few controls make it right. The side panel shows the mean
+and the worst error in metres: a large error usually means a misplaced click.
+
+When every point is placed, press **Save CSV and view**. The app finds the scale, rotation
+and shift that put the track on your clicks, and works out when you reached each control, so
+you do not have to mark the time of each control. The small GPS drift between controls is then
+removed, so that the track goes through every control. The result is saved as a CSV file and
+opened in the viewer. **Recalibrate** goes back to the clicks, which are kept.
+
+Then a window asks when you were at the triangle: a slider goes from the start of the watch to
+the moment you reached control 1. Move it to the time you were at the triangle; leg 1 is drawn
+on the map from that moment. **Done** starts leg 1 there and rewrites the CSV, **Cancel** keeps
+the automatic start (the track point nearest to the triangle). The watch laps are not used.
 
 Notes:
 
-- The start triangle is not a control. By default it only marks where leg 1 begins (the
-  nearest point of the track before control 1) and is not used for the fit. Whatever the
-  watch recorded before that point is left out.
-- Tick **I pressed lap at the triangle** if you pressed the lap button of the watch when
-  you were at the triangle. The first watch lap then ends at the triangle: that gives the
-  exact time of the start, the triangle is used in the fit, and everything before it is
-  ignored. Leave it unticked otherwise: if the assumption is wrong the error becomes large.
+- The start triangle is not a control: it only marks where leg 1 begins. Whatever the watch
+  recorded before that moment is left out.
 - The legs are not independent. The scale, rotation and shift are common to the whole map,
   and the moments of the controls are searched together, in order. Only the drift
   correction of a leg depends on its own two controls.

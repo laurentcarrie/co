@@ -91,12 +91,8 @@ struct Solution {
     rms: f64,
 }
 
-fn refine(init: Sim, pts: &[V], clicks: &[V], anchor: Option<(V, V)>) -> Option<Solution> {
-    let pairs_of = |visit: &[usize]| {
-        let mut p: Vec<(V, V)> = visit.iter().zip(clicks).map(|(&i, &c)| (pts[i], c)).collect();
-        p.extend(anchor);
-        p
-    };
+fn refine(init: Sim, pts: &[V], clicks: &[V]) -> Option<Solution> {
+    let pairs_of = |visit: &[usize]| -> Vec<(V, V)> { visit.iter().zip(clicks).map(|(&i, &c)| (pts[i], c)).collect() };
     let mut sim = init;
     let mut visit = assign(&sim, pts, clicks);
     for _ in 0..40 {
@@ -121,15 +117,12 @@ fn bbox(v: &[V]) -> (V, V) {
     (lo, hi)
 }
 
-/// `anchor` is an optional fixed (track point, click) pair, known in advance (not searched).
-fn solve(pts: &[V], clicks: &[V], anchor: Option<(V, V)>) -> Result<Solution> {
+fn solve(pts: &[V], clicks: &[V]) -> Result<Solution> {
     // Nothing ties the track ends to the clicks (the watch may run before the start and after the
     // finish), so start from many guesses: the map is roughly north-up, and the scale is about the
     // ratio of the extents of the clicks and of the track. Several small rotations and scale errors
     // are tried; the DP + least-squares loop converges from the right one, the best fit wins.
-    let mut all_clicks = clicks.to_vec();
-    all_clicks.extend(anchor.map(|a| a.1));
-    let ((tl, th), (cl, ch)) = (bbox(pts), bbox(&all_clicks));
+    let ((tl, th), (cl, ch)) = (bbox(pts), bbox(clicks));
     let (td, cd) = ((th.0 - tl.0).hypot(th.1 - tl.1), (ch.0 - cl.0).hypot(ch.1 - cl.1));
     let mut inits = Vec::new();
     if td > 1.0 && cd > 1.0 {
@@ -140,30 +133,53 @@ fn solve(pts: &[V], clicks: &[V], anchor: Option<(V, V)>) -> Result<Solution> {
                 let s = cd / td * mul;
                 let (sin, cos) = (deg as f64).to_radians().sin_cos();
                 let a = (s * cos, s * sin);
-                // Match the anchor exactly when there is one, else the centres of the extents.
-                let (z, w) = anchor.unwrap_or((tc, cc));
-                let rot = (a.0 * z.0 - a.1 * z.1, a.0 * z.1 + a.1 * z.0);
-                inits.push(Sim { a, b: (w.0 - rot.0, w.1 - rot.1) });
+                // Match the centres of the extents.
+                let rot = (a.0 * tc.0 - a.1 * tc.1, a.0 * tc.1 + a.1 * tc.0);
+                inits.push(Sim { a, b: (cc.0 - rot.0, cc.1 - rot.1) });
             }
         }
     }
     inits
         .into_iter()
-        .filter_map(|i| refine(i, pts, clicks, anchor))
+        .filter_map(|i| refine(i, pts, clicks))
         .min_by(|a, b| a.rms.total_cmp(&b.rms))
         .context("could not fit the track to the clicked controls")
 }
 
+/// A GPS point of the track, placed on the map.
+pub struct TrackPoint {
+    /// Index into the TCX samples.
+    pub sample: usize,
+    /// Seconds since the first sample.
+    pub t: f64,
+    /// Fitted position, in page pixels.
+    pub page: V,
+}
+
 pub struct Report {
     pub scale_px_per_m: f64,
-    /// (label, error in metres) for the controls and the finish.
+    /// (label, error in metres) for the placed controls and the finish.
     pub errors_m: Vec<(String, f64)>,
     pub mean_err_m: f64,
     pub max_err_m: f64,
-    /// Distance between the clicked start triangle and the track point chosen as the start of leg 1:
-    /// the end of lap 1 if the lap was pressed at the triangle, else the nearest point before control 1.
+    /// Distance between the clicked start triangle and the track point chosen as the start of leg 1.
     pub start_gap_m: f64,
     pub rows: usize,
+    /// Every GPS point of the track, fitted, in page pixels.
+    pub track: Vec<TrackPoint>,
+    /// Index into `track` of the start of leg 1.
+    pub start_idx: usize,
+    /// For every placed control and the finish: (slot, index into `track` of its visit). Slot 1 is
+    /// control 1, the last slot is the finish.
+    pub visits: Vec<(usize, usize)>,
+}
+
+impl Report {
+    /// The track from the watch start to the first placed control: when the triangle was passed is
+    /// somewhere in there.
+    pub fn before_first_control(&self) -> &[TrackPoint] {
+        &self.track[..=self.visits[0].1]
+    }
 }
 
 /// Label of control `j` (0-based among the controls and the finish).
@@ -171,15 +187,30 @@ fn label(j: usize, n_ctrl: usize) -> String {
     if j + 1 == n_ctrl { "F".into() } else { (j + 1).to_string() }
 }
 
-/// Fits the track to `clicks` (page pixels: start triangle, controls, finish) and writes the CSV.
-/// CSV pixel coordinates are page pixels divided by `csv_to_page`.
-pub fn calibrate(samples: &[Sample], clicks: &[V], csv_to_page: f64, lap_at_triangle: bool, out: &Path) -> Result<Report> {
-    if clicks.len() < 3 {
-        bail!("click the start triangle, at least one control and the finish");
+/// Fits the track to `slots` (page pixels: start triangle, controls, finish; `None` for a point
+/// not placed yet). The triangle and the finish are required, the controls are optional.
+///
+/// With `out`, also writes the CSV (CSV pixel coordinates are page pixels divided by `csv_to_page`);
+/// then every point must be placed. `start_sample` is the sample where the triangle was passed,
+/// when the user said so: leg 1 starts there instead of at the track point nearest to the triangle.
+pub fn calibrate(
+    samples: &[Sample],
+    slots: &[Option<V>],
+    csv_to_page: f64,
+    start_sample: Option<usize>,
+    out: Option<&Path>,
+) -> Result<Report> {
+    let n_leg = slots.len().saturating_sub(1); // controls and finish
+    if n_leg < 1 || slots[0].is_none() || slots[n_leg].is_none() {
+        bail!("place the start triangle and the finish");
     }
-    let (start, ctrl) = (clicks[0], &clicks[1..]);
+    if out.is_some() && slots.iter().any(Option::is_none) {
+        bail!("place every control first");
+    }
+    let placed: Vec<(usize, V)> = slots.iter().enumerate().filter_map(|(k, c)| c.map(|c| (k, c))).collect();
+    let clicks: Vec<V> = placed.iter().map(|p| p.1).collect();
     let gps: Vec<usize> = (0..samples.len()).filter(|&i| samples[i].lat_lon.is_some()).collect();
-    if gps.len() < ctrl.len() + 1 {
+    if gps.len() < clicks.len() + 1 {
         bail!("the track has fewer GPS points than clicks");
     }
     let (lat0, lon0) = (
@@ -196,110 +227,169 @@ pub fn calibrate(samples: &[Sample], clicks: &[V], csv_to_page: f64, lap_at_tria
         })
         .collect();
 
-    // Race part of the track. If the lap button was pressed at the triangle, the first watch lap
-    // (watch start -> triangle) ends exactly there: the triangle is then a real anchor, visited at
-    // the end of lap 1, and everything before it (whose start is not on the map) is ignored.
-    // Otherwise the triangle is only a marker for the start of leg 1 and is not used in the fit.
-    let (anchor_j, race_from) = if lap_at_triangle {
-        if samples.iter().all(|s| s.lap == 0) {
-            bail!("the TCX has a single lap: there is no lap press at the triangle");
-        }
-        let end = samples.iter().rposition(|s| s.lap == 0).unwrap_or(0);
-        let j = gps.partition_point(|&i| i <= end).saturating_sub(1); // last GPS point of lap 1
-        (Some(j), j + 1)
-    } else {
-        (None, 0)
-    };
-    if pts.len() - race_from < ctrl.len() {
-        bail!("not enough GPS points after the triangle");
-    }
-    let sol = solve(&pts[race_from..], ctrl, anchor_j.map(|j| (pts[j], start)))?;
+    // The start triangle takes part in the fit like the controls: it is only a position, the moment
+    // the runner was there is searched with the others (and refined later by the user).
+    let sol = solve(&pts, &clicks)?;
     let sim = sol.sim;
     let scale = sim.scale();
-    let visit: Vec<usize> = sol.visit.iter().map(|&i| i + race_from).collect();
-    // Leg 1 begins at the lap-1 end if known, else at the track point nearest to the triangle.
-    let start_j = anchor_j.unwrap_or_else(|| {
-        (0..visit[0].max(1))
-            .min_by(|&a, &b| d2(sim.apply(pts[a]), start).total_cmp(&d2(sim.apply(pts[b]), start)))
-            .unwrap_or(0)
-    });
+    let (start, start_visit) = (clicks[0], sol.visit[0]);
+    let (ctrl, visit) = (&clicks[1..], &sol.visit[1..]);
+    // Leg 1 begins where the user said, else at the visit of the triangle.
+    let start_j = start_sample
+        .map(|s| gps.partition_point(|&i| i <= s).saturating_sub(1).min(visit[0].saturating_sub(1)))
+        .unwrap_or(start_visit);
 
-    // Constant offsets at each anchored point (triangle if known, controls, finish), interpolated
-    // in between to cancel GPS drift.
-    let mut fidx: Vec<usize> = anchor_j.into_iter().collect();
-    let mut fcl: Vec<V> = anchor_j.map(|_| start).into_iter().collect();
-    fidx.extend(&visit);
-    fcl.extend(ctrl);
-    let off: Vec<V> = fidx
+    // Constant offsets at each clicked control and the finish, interpolated in between to cancel GPS
+    // drift.
+    let off: Vec<V> = visit
         .iter()
-        .zip(&fcl)
+        .zip(ctrl)
         .map(|(&i, &c)| {
             let p = sim.apply(pts[i]);
             (c.0 - p.0, c.1 - p.1)
         })
         .collect();
     let offset_at = |i: usize| -> V {
-        if i <= fidx[0] {
+        if i <= visit[0] {
             return off[0];
         }
-        if i >= fidx[fidx.len() - 1] {
+        if i >= visit[visit.len() - 1] {
             return off[off.len() - 1];
         }
-        let c = fidx.partition_point(|&x| x <= i) - 1;
-        let f = (i - fidx[c]) as f64 / (fidx[c + 1] - fidx[c]) as f64;
+        let c = visit.partition_point(|&x| x <= i) - 1;
+        let f = (i - visit[c]) as f64 / (visit[c + 1] - visit[c]) as f64;
         (off[c].0 + (off[c + 1].0 - off[c].0) * f, off[c].1 + (off[c + 1].1 - off[c].1) * f)
     };
+    let page_of = |j: usize| -> V {
+        let (p, o) = (sim.apply(pts[j]), offset_at(j));
+        (p.0 + o.0, p.1 + o.1)
+    };
 
-    // Leg of every sample: leg j covers visit[j-1]+1 ..= visit[j]; leg 0 starts at the triangle.
-    let visit_sample: Vec<usize> = visit.iter().map(|&j| gps[j]).collect();
-    let mut leg_of: Vec<Option<usize>> = vec![None; samples.len()];
-    for j in 0..ctrl.len() {
-        let lo = if j == 0 { gps[start_j] } else { visit_sample[j - 1] + 1 };
-        for s in lo..=visit_sample[j] {
-            leg_of[s] = Some(j);
+    if let Some(out) = out {
+        // Leg of every sample: leg j covers visit[j-1]+1 ..= visit[j]; leg 0 starts at the triangle.
+        let visit_sample: Vec<usize> = visit.iter().map(|&j| gps[j]).collect();
+        let mut leg_of: Vec<Option<usize>> = vec![None; samples.len()];
+        for j in 0..n_leg {
+            let lo = if j == 0 { gps[start_j] } else { visit_sample[j - 1] + 1 };
+            for s in lo..=visit_sample[j] {
+                leg_of[s] = Some(j);
+            }
         }
-    }
-    let gps_pos: std::collections::HashMap<usize, usize> = gps.iter().enumerate().map(|(j, &s)| (s, j)).collect();
+        let gps_pos: std::collections::HashMap<usize, usize> = gps.iter().enumerate().map(|(j, &s)| (s, j)).collect();
 
-    let mut w = csv::Writer::from_path(out).with_context(|| format!("cannot write {}", out.display()))?;
-    w.write_record([
-        "time_utc", "elapsed_s", "to_control", "lat", "lon", "elevation_m", "heart_rate", "speed_ms",
-        "pace_min_km", "distance_m", "x_px", "y_px", "x_px_fit", "y_px_fit",
-    ])?;
-    let f = |v: Option<f64>| v.map_or(String::new(), |x| x.to_string());
-    let px = |x: f64| format!("{:.1}", x / csv_to_page);
-    for (s, smp) in samples.iter().enumerate() {
-        let (mut x, mut y, mut xf, mut yf) = (String::new(), String::new(), String::new(), String::new());
-        if let Some(&j) = gps_pos.get(&s) {
-            let p = sim.apply(pts[j]);
-            let o = offset_at(j);
-            (x, y, xf, yf) = (px(p.0), px(p.1), px(p.0 + o.0), px(p.1 + o.1));
-        }
-        let leg = leg_of[s].map_or(String::new(), |j| label(j, ctrl.len()));
-        let (la, lo) = smp.lat_lon.unzip();
-        let pace = (smp.speed > 0.3).then(|| 1000.0 / smp.speed / 60.0);
+        let mut w = csv::Writer::from_path(out).with_context(|| format!("cannot write {}", out.display()))?;
         w.write_record([
-            smp.time_utc.clone(), format!("{:.0}", smp.t), leg, f(la), f(lo), f(smp.ele), f(smp.hr),
-            format!("{:.2}", smp.speed), f(pace), format!("{:.1}", smp.dist), x, y, xf, yf,
+            "time_utc", "elapsed_s", "to_control", "lat", "lon", "elevation_m", "heart_rate", "speed_ms",
+            "pace_min_km", "distance_m", "x_px", "y_px", "x_px_fit", "y_px_fit",
         ])?;
+        let f = |v: Option<f64>| v.map_or(String::new(), |x| x.to_string());
+        let px = |x: f64| format!("{:.1}", x / csv_to_page);
+        for (s, smp) in samples.iter().enumerate() {
+            let (mut x, mut y, mut xf, mut yf) = (String::new(), String::new(), String::new(), String::new());
+            if let Some(&j) = gps_pos.get(&s) {
+                let p = sim.apply(pts[j]);
+                let fit = page_of(j);
+                (x, y, xf, yf) = (px(p.0), px(p.1), px(fit.0), px(fit.1));
+            }
+            let leg = leg_of[s].map_or(String::new(), |j| label(j, n_leg));
+            let (la, lo) = smp.lat_lon.unzip();
+            let pace = (smp.speed > 0.3).then(|| 1000.0 / smp.speed / 60.0);
+            w.write_record([
+                smp.time_utc.clone(), format!("{:.0}", smp.t), leg, f(la), f(lo), f(smp.ele), f(smp.hr),
+                format!("{:.2}", smp.speed), f(pace), format!("{:.1}", smp.dist), x, y, xf, yf,
+            ])?;
+        }
+        w.flush()?;
     }
-    w.flush()?;
 
     let errors_m: Vec<(String, f64)> = visit
         .iter()
         .zip(ctrl)
-        .enumerate()
-        .map(|(j, (&i, &cl))| (label(j, ctrl.len()), d2(sim.apply(pts[i]), cl).sqrt() / scale))
+        .zip(&placed[1..])
+        .map(|((&i, &cl), &(slot, _))| (label(slot - 1, n_leg), d2(sim.apply(pts[i]), cl).sqrt() / scale))
         .collect();
     let mean_err_m = errors_m.iter().map(|e| e.1).sum::<f64>() / errors_m.len() as f64;
     let max_err_m = errors_m.iter().map(|e| e.1).fold(0.0, f64::max);
     let start_gap_m = d2(sim.apply(pts[start_j]), start).sqrt() / scale;
-    Ok(Report { scale_px_per_m: scale, errors_m, mean_err_m, max_err_m, start_gap_m, rows: samples.len() })
+    Ok(Report {
+        scale_px_per_m: scale,
+        errors_m,
+        mean_err_m,
+        max_err_m,
+        start_gap_m,
+        rows: samples.len(),
+        track: (0..gps.len()).map(|j| TrackPoint { sample: gps[j], t: samples[gps[j]].t, page: page_of(j) }).collect(),
+        start_idx: start_j,
+        visits: placed[1..].iter().zip(visit).map(|(&(slot, _), &j)| (slot, j)).collect(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L-shaped track (east, then north), one sample per second, 7.86 m per sample; the map is
+    /// at 0.2 px/m. Triangle at sample 20, controls at 40, 50 (the corner), 75, finish at 95.
+    fn l_track() -> (Vec<Sample>, Vec<V>) {
+        let step_m = 7.86;
+        let (dlon, dlat) = (1e-4, step_m / 111_195.0);
+        let samples: Vec<Sample> = (0..100)
+            .map(|i| {
+                let (e, n) = (i.min(50) as f64, (i.max(50) - 50) as f64);
+                Sample {
+                    time_utc: format!("t{i}"),
+                    t: i as f64,
+                    lat_lon: Some((45.0 + n * dlat, 5.0 + e * dlon)),
+                    ele: None,
+                    hr: None,
+                    dist: i as f64 * step_m,
+                    speed: 3.0,
+                }
+            })
+            .collect();
+        let px = |i: usize| {
+            let (e, n) = (i.min(50) as f64, (i.max(50) - 50) as f64);
+            (e * step_m * 0.2, 500.0 - n * step_m * 0.2)
+        };
+        (samples, [20, 40, 50, 75, 95].into_iter().map(px).collect())
+    }
+
+    #[test]
+    fn start_sample_sets_start_of_leg_1() {
+        let (samples, clicks) = l_track();
+        let clicks: Vec<Option<V>> = clicks.into_iter().map(Some).collect();
+        let out = std::env::temp_dir().join("vcc-start-test.csv");
+        let auto = calibrate(&samples, &clicks, 1.0, None, Some(&out)).unwrap();
+        let before = auto.before_first_control();
+        assert!(before.len() > 2);
+        assert_eq!(before[0].sample, 0);
+        assert!(before.last().unwrap().t > 10.0);
+        let chosen = calibrate(&samples, &clicks, 1.0, Some(10), Some(&out)).unwrap();
+        assert_eq!(chosen.track[chosen.start_idx].sample, 10);
+        // The fit does not depend on the start of leg 1.
+        assert!((chosen.mean_err_m - auto.mean_err_m).abs() < 1e-9);
+        let csv = std::fs::read_to_string(&out).unwrap();
+        let first = csv.lines().skip(1).position(|l| l.split(',').nth(2) == Some("1")).unwrap();
+        assert_eq!(first, 10);
+    }
+
+    #[test]
+    fn fits_with_missing_controls() {
+        let (samples, clicks) = l_track();
+        let mut slots: Vec<Option<V>> = clicks.into_iter().map(Some).collect();
+        slots[2] = None;
+        slots[3] = None;
+        let r = calibrate(&samples, &slots, 1.0, None, None).unwrap();
+        assert_eq!(r.visits.iter().map(|v| v.0).collect::<Vec<_>>(), [1, 4]);
+        // Only the triangle and the finish: a (rough) route is still drawn.
+        slots[1] = None;
+        assert!(calibrate(&samples, &slots, 1.0, None, None).is_ok());
+        // Writing the CSV needs every point.
+        assert!(calibrate(&samples, &slots, 1.0, None, Some(&std::env::temp_dir().join("vcc-x.csv"))).is_err());
+        // The triangle and the finish are required.
+        slots[0] = None;
+        assert!(calibrate(&samples, &slots, 1.0, None, None).is_err());
+    }
 
     /// Local check against a real race. Run with:
     /// VCC_TCX=... VCC_CLICKS="x,y;x,y;..." cargo test -- --ignored --nocapture
@@ -307,18 +397,17 @@ mod tests {
     #[ignore]
     fn real_race() {
         let tcx = std::env::var("VCC_TCX").unwrap();
-        let clicks: Vec<V> = std::env::var("VCC_CLICKS")
+        let clicks: Vec<Option<V>> = std::env::var("VCC_CLICKS")
             .unwrap()
             .split(';')
             .map(|p| {
                 let (x, y) = p.split_once(',').unwrap();
-                (x.parse().unwrap(), y.parse().unwrap())
+                Some((x.parse().unwrap(), y.parse().unwrap()))
             })
             .collect();
         let samples = crate::tcx::load(Path::new(&tcx)).unwrap();
         let out = std::env::temp_dir().join("vcc-test.csv");
-        let lap = std::env::var("VCC_LAP").is_ok();
-        let r = calibrate(&samples, &clicks, 1.0, lap, &out).unwrap();
+        let r = calibrate(&samples, &clicks, 1.0, None, Some(&out)).unwrap();
         println!("scale {:.3} px/m, mean {:.1} m, max {:.1} m", r.scale_px_per_m, r.mean_err_m, r.max_err_m);
         for (l, e) in &r.errors_m {
             println!("  {l}: {e:.1} m");

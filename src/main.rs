@@ -1,5 +1,6 @@
 mod app;
 mod calib;
+mod detect;
 mod model;
 mod pdf;
 mod tcx;
@@ -23,6 +24,10 @@ struct Args {
     /// Where to write the CSV generated from --tcx (default: next to it, `*-legs.csv`).
     #[arg(long, requires = "tcx")]
     out: Option<PathBuf>,
+    /// With --tcx, how many controls the course has, the finish not included.
+    #[arg(long, value_name = "N", requires = "tcx", default_value_t = app::DEFAULT_CONTROLS,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    controls: u32,
     /// Width in pixels of the page image the CSV coordinates refer to.
     /// Defaults to the size of the scan embedded in the PDF.
     #[arg(long)]
@@ -43,7 +48,7 @@ fn main() -> Result<()> {
                 let stem = tcx_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 tcx_path.with_file_name(format!("{stem}-legs.csv"))
             });
-            (model::Course::empty(), Some(app::CalibSession::new(samples, out)))
+            (model::Course::empty(), Some(app::CalibSession::new(samples, out, args.controls as usize)))
         }
         (None, Some(csv_path)) => (model::Course::load(csv_path)?, None),
         (None, None) => anyhow::bail!("give either --csv <file> or --tcx <file>"),

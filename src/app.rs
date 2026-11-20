@@ -1,25 +1,86 @@
 use crate::calib;
+use crate::detect;
 use crate::model::{Course, Leg, Point};
 use crate::pdf::PageImage;
 use crate::tcx::Sample;
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
 use std::path::PathBuf;
 
+type Click = (f64, f64);
+
+/// Controls proposed when starting, before the user adds or removes some.
+pub const DEFAULT_CONTROLS: u32 = 10;
+
 /// Data needed to (re)calibrate a track on the map.
 pub struct CalibSession {
     pub samples: Vec<Sample>,
     pub out: PathBuf,
-    /// Clicked controls in page pixels: start, 1..n, finish.
-    clicks: Vec<(f64, f64)>,
+    /// Places in page pixels: start triangle, controls 1..n, finish. `None` until clicked.
+    slots: Vec<Option<Click>>,
+    /// The place the next click on the map goes to.
+    selected: Option<usize>,
     message: String,
+    /// The last fit: a preview of the route while placing, the saved result afterwards.
     report: Option<calib::Report>,
-    /// The lap button was pressed at the triangle: the first watch lap ends there.
-    lap_at_triangle: bool,
+    /// While the user is placing themselves at the start triangle: the chosen time, in seconds
+    /// since the watch start.
+    placing: Option<f64>,
 }
 
 impl CalibSession {
-    pub fn new(samples: Vec<Sample>, out: PathBuf) -> Self {
-        CalibSession { samples, out, clicks: Vec::new(), message: String::new(), report: None, lap_at_triangle: false }
+    pub fn new(samples: Vec<Sample>, out: PathBuf, controls: usize) -> Self {
+        CalibSession {
+            samples,
+            out,
+            slots: vec![None; controls + 2],
+            selected: Some(0),
+            message: String::new(),
+            report: None,
+            placing: None,
+        }
+    }
+
+    /// Name of a place: "Start", "1", ..., "Finish".
+    fn slot_name(&self, k: usize) -> String {
+        match k {
+            0 => "Start".into(),
+            k if k + 1 == self.slots.len() => "Finish".into(),
+            k => k.to_string(),
+        }
+    }
+
+    /// Short name on the map: "S", "1", ..., "F".
+    fn slot_tag(&self, k: usize) -> String {
+        match k {
+            0 => "S".into(),
+            k if k + 1 == self.slots.len() => "F".into(),
+            k => k.to_string(),
+        }
+    }
+
+    /// First place still to place, after `k` (then from the beginning).
+    fn next_unplaced(&self, k: usize) -> Option<usize> {
+        (k + 1..self.slots.len()).chain(0..k).find(|&i| self.slots[i].is_none())
+    }
+
+    /// Fits the track to what is placed, to show the route. Needs the triangle and the finish.
+    fn refresh_preview(&mut self, csv_to_page: f64) {
+        self.placing = None;
+        if self.slots[0].is_none() || self.slots[self.slots.len() - 1].is_none() {
+            self.report = None;
+            self.message.clear();
+            return;
+        }
+        match calib::calibrate(&self.samples, &self.slots, csv_to_page, None, None) {
+            Ok(r) => {
+                self.report = Some(r);
+                self.message.clear();
+            }
+            Err(e) => {
+                self.report = None;
+                self.message = format!("Error: {e:#}");
+            }
+        }
     }
 }
 
@@ -86,6 +147,15 @@ impl App {
         let speed_range = course.range(|p| (p.speed > 0.3).then_some(p.speed));
         let hr_range = course.range(|p| p.hr);
         let course_is_empty = course.legs.is_empty();
+        let mut calib = calib;
+        if let Some(cal) = calib.as_mut().filter(|_| course_is_empty) {
+            // First guess of the places, from the circles printed on the map. The user can move them.
+            let det = detect::detect(&page, cal.slots.len() - 2);
+            cal.slots = det.slots;
+            cal.selected = cal.slots.iter().position(Option::is_none);
+            cal.refresh_preview(csv_to_page as f64);
+            cal.message = det.note;
+        }
         App {
             course,
             page_size: Vec2::new(page.width as f32, page.height as f32),
@@ -106,15 +176,21 @@ impl App {
         }
     }
 
-    /// Fits the track to the clicked controls, writes the CSV and switches to the viewer.
-    fn run_calibration(&mut self) {
+    /// Writes the CSV and switches to the viewer. `start_sample` is the sample where the user passed
+    /// the triangle, once they have said so: until then the placement window opens.
+    fn run_calibration(&mut self, start_sample: Option<usize>) {
         let Some(cal) = self.calib.as_mut() else { return };
         let csv_to_page = self.csv_to_page as f64;
-        match calib::calibrate(&cal.samples, &cal.clicks, csv_to_page, cal.lap_at_triangle, &cal.out)
+        match calib::calibrate(&cal.samples, &cal.slots, csv_to_page, start_sample, Some(&cal.out))
             .and_then(|r| Course::load(&cal.out).map(|c| (r, c)))
         {
             Ok((report, course)) => {
                 cal.message = format!("Saved {}", cal.out.display());
+                cal.placing = (start_sample.is_none() && report.before_first_control().len() >= 2)
+                    .then(|| report.track[report.start_idx].t);
+                if cal.placing.is_some() {
+                    self.pending_fit = Some(0);
+                }
                 cal.report = Some(report);
                 self.speed_range = course.range(|p| (p.speed > 0.3).then_some(p.speed));
                 self.hr_range = course.range(|p| p.hr);
@@ -128,40 +204,79 @@ impl App {
     }
 
     fn calibration_panel(&mut self, ui: &mut egui::Ui) {
+        let csv_to_page = self.csv_to_page as f64;
         let Some(cal) = self.calib.as_mut() else { return };
         ui.heading("Calibration");
-        ui.label("Click on the map, in this order: the start triangle (it only marks where leg 1 begins), control 1, 2, ... and the finish. Then press Compute.");
-        let n = cal.clicks.len();
-        let next = if n == 0 { "start triangle".to_string() } else { format!("control {n} (or the finish)") };
-        ui.label(egui::RichText::new(format!("Next click: {next}")).strong());
+        ui.label("Click a row, then click its place on the map. The route is drawn once the start and the finish are placed, and updated with each control.");
         ui.separator();
-        ui.label(format!("{n} points placed"));
+        let mut changed = false;
         ui.horizontal(|ui| {
-            if ui.add_enabled(n > 0, egui::Button::new("Undo")).clicked() {
-                cal.clicks.pop();
+            let n = cal.slots.len() - 2;
+            ui.label(format!("Controls: {n}"));
+            if ui.add_enabled(n > 1, egui::Button::new("−")).on_hover_text("Remove the last control").clicked() {
+                cal.slots.remove(n);
+                changed = true;
             }
-            if ui.add_enabled(n > 0, egui::Button::new("Reset")).clicked() {
-                cal.clicks.clear();
+            if ui.button("+").on_hover_text("Add a control before the finish").clicked() {
+                cal.slots.insert(n + 1, None);
+                changed = true;
             }
         });
-        let laps = cal.samples.iter().map(|s| s.lap).max().map_or(0, |m| m + 1);
-        ui.add_enabled_ui(laps >= 2, |ui| {
-            ui.checkbox(&mut cal.lap_at_triangle, "I pressed lap at the triangle")
-                .on_hover_text("The first watch lap then ends at the triangle: its start is not on the map and is ignored.");
+        let mut clear = None;
+        egui::ScrollArea::vertical().max_height(ui.available_height() - 170.0).show(ui, |ui| {
+            egui::Grid::new("slots").num_columns(3).striped(true).show(ui, |ui| {
+                for k in 0..cal.slots.len() {
+                    let placed = cal.slots[k].is_some();
+                    let color = if placed { ui.visuals().text_color() } else { Color32::GRAY };
+                    let name = egui::RichText::new(cal.slot_name(k)).color(color);
+                    if ui.selectable_label(cal.selected == Some(k), name).clicked() {
+                        cal.selected = Some(k);
+                    }
+                    ui.label(egui::RichText::new(if placed { "placed" } else { "—" }).color(color));
+                    if placed && ui.small_button("✕").on_hover_text("Remove this point").clicked() {
+                        clear = Some(k);
+                    }
+                    ui.end_row();
+                }
+            });
         });
-        if laps < 2 {
-            ui.label("(this TCX has a single lap)");
+        if let Some(k) = clear {
+            cal.slots[k] = None;
+            cal.selected = Some(k);
+            changed = true;
         }
-        let compute = ui.add_enabled(n >= 3, egui::Button::new("Compute (last point = finish)"));
+        if changed {
+            if cal.selected.is_some_and(|k| k >= cal.slots.len()) {
+                cal.selected = None;
+            }
+            cal.refresh_preview(csv_to_page);
+        }
+        ui.separator();
+        match &cal.selected {
+            Some(k) => ui.label(egui::RichText::new(format!("Click on the map to place: {}", cal.slot_name(*k))).strong()),
+            None => ui.label("Click a row to place or move a point."),
+        };
+        if let Some(r) = &cal.report {
+            ui.label(format!("Error: mean {:.0} m, max {:.0} m", r.mean_err_m, r.max_err_m));
+        }
         if !cal.message.is_empty() {
             ui.label(&cal.message);
         }
+        let all = cal.slots.iter().all(Option::is_some);
+        let compute = ui
+            .add_enabled(all, egui::Button::new("Save CSV and view"))
+            .on_disabled_hover_text("Place every point first");
         if compute.clicked() {
-            self.run_calibration();
+            self.run_calibration(None);
         }
         if self.course.legs.len() > 0 && ui.button("Back to viewer").clicked() {
             self.calibrating = false;
         }
+    }
+
+    /// True while the user is choosing when they passed the start triangle.
+    fn placing_start(&self) -> bool {
+        self.calib.as_ref().is_some_and(|c| c.placing.is_some())
     }
 
     fn leg_color(i: usize) -> Color32 {
@@ -249,6 +364,9 @@ impl App {
             }
             if ui.button("Recalibrate").clicked() {
                 self.calibrating = true;
+                if let Some(cal) = self.calib.as_mut() {
+                    cal.placing = None;
+                }
             }
             ui.separator();
         }
@@ -326,6 +444,42 @@ impl App {
         });
     }
 
+    /// Window to say when the start triangle was passed.
+    fn placement_window(&mut self, ctx: &egui::Context) {
+        let Some(cal) = self.calib.as_mut() else { return };
+        let (Some(mut t), Some(report)) = (cal.placing, cal.report.as_ref()) else { return };
+        let before = report.before_first_control();
+        let (Some(first), Some(last)) = (before.first(), before.last()) else { return };
+        let (t0, t1) = (first.t, last.t);
+        let (mut done, mut cancel) = (false, false);
+        egui::Window::new("When did you pass the start triangle?")
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 10.0])
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Move the slider to the moment you were at the triangle: leg 1 is drawn from there.");
+                ui.spacing_mut().slider_width = 420.0;
+                ui.add(
+                    egui::Slider::new(&mut t, t0..=t1)
+                        .show_value(false)
+                        .text(format!("watch start {} → control 1 {}", fmt_dur(0.0), fmt_dur(t1 - t0))),
+                );
+                ui.label(format!("Triangle at {} after the watch start; leg 1 lasts {}.", fmt_dur(t - t0), fmt_dur(t1 - t)));
+                ui.horizontal(|ui| {
+                    done = ui.button("Done").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        cal.placing = Some(t);
+        if done {
+            // Last GPS point at or before the chosen time.
+            let sample = before.iter().rev().find(|p| p.t <= t).map(|p| p.sample);
+            self.run_calibration(sample);
+        } else if cancel {
+            cal.placing = None;
+        }
+    }
+
     fn bottom_panel(&mut self, ui: &mut egui::Ui) {
         let Selection::Leg(i) = self.selection else {
             ui.label("Select a leg to scrub through it.");
@@ -371,6 +525,43 @@ impl App {
         }
     }
 
+    /// Places the selected point where the map is clicked, and draws the placed points and the route.
+    fn calibration_overlay(&mut self, resp: &egui::Response, painter: &egui::Painter, rect: Rect) {
+        let csv_to_page = self.csv_to_page as f64;
+        let (offset, zoom, page_size) = (self.offset, self.zoom, self.page_size);
+        let Some(cal) = self.calib.as_mut() else { return };
+        if resp.clicked() {
+            if let (Some(pos), Some(k)) = (resp.interact_pointer_pos(), cal.selected) {
+                let p = (pos - rect.min - offset) / zoom;
+                if p.x >= 0.0 && p.y >= 0.0 && p.x <= page_size.x && p.y <= page_size.y {
+                    cal.slots[k] = Some((p.x as f64, p.y as f64));
+                    cal.selected = cal.next_unplaced(k);
+                    cal.refresh_preview(csv_to_page);
+                }
+            }
+        }
+        let screen = |c: Click| rect.min + offset + Vec2::new(c.0 as f32, c.1 as f32) * zoom;
+        // The route, from the start of leg 1 to the last placed point, one colour per leg.
+        if let Some(r) = &cal.report {
+            let mut from = r.start_idx;
+            for &(slot, to) in &r.visits {
+                let line: Vec<Pos2> = r.track[from..=to].iter().map(|p| screen(p.page)).collect();
+                painter.add(egui::Shape::line(line, Stroke::new(3.0, Self::leg_color(slot - 1))));
+                from = to;
+            }
+        }
+        let magenta = Color32::from_rgb(200, 0, 200);
+        let placed: Vec<Pos2> = cal.slots.iter().flatten().map(|c| screen(*c)).collect();
+        painter.add(egui::Shape::line(placed, Stroke::new(1.0, magenta.gamma_multiply(0.6))));
+        for (k, c) in cal.slots.iter().enumerate() {
+            let Some(c) = c else { continue };
+            let p = screen(*c);
+            let radius = if cal.selected == Some(k) { 6.0 } else { 4.0 };
+            painter.circle_filled(p, radius, magenta);
+            painter.text(p + Vec2::new(8.0, -8.0), egui::Align2::LEFT_BOTTOM, cal.slot_tag(k), egui::FontId::proportional(16.0), Color32::from_rgb(120, 0, 160));
+        }
+    }
+
     fn map_view(&mut self, ui: &mut egui::Ui) {
         let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
         let rect = resp.rect;
@@ -406,26 +597,7 @@ impl App {
         }
 
         if self.calibrating {
-            if resp.clicked() {
-                if let (Some(pos), Some(cal)) = (resp.interact_pointer_pos(), self.calib.as_mut()) {
-                    let p = (pos - rect.min - self.offset) / self.zoom;
-                    if p.x >= 0.0 && p.y >= 0.0 && p.x <= self.page_size.x && p.y <= self.page_size.y {
-                        cal.clicks.push((p.x as f64, p.y as f64));
-                        cal.message.clear();
-                    }
-                }
-            }
-            if let Some(cal) = &self.calib {
-                let screen = |c: &(f64, f64)| rect.min + self.offset + Vec2::new(c.0 as f32, c.1 as f32) * self.zoom;
-                let line: Vec<Pos2> = cal.clicks.iter().map(screen).collect();
-                painter.add(egui::Shape::line(line, Stroke::new(1.0, Color32::from_rgb(200, 0, 200))));
-                for (k, c) in cal.clicks.iter().enumerate() {
-                    let p = screen(c);
-                    painter.circle_filled(p, 4.0, Color32::from_rgb(200, 0, 200));
-                    let text = if k == 0 { "S".to_string() } else { k.to_string() };
-                    painter.text(p + Vec2::new(8.0, -8.0), egui::Align2::LEFT_BOTTOM, text, egui::FontId::proportional(16.0), Color32::from_rgb(120, 0, 160));
-                }
-            }
+            self.calibration_overlay(&resp, &painter, rect);
             return;
         }
 
@@ -437,6 +609,8 @@ impl App {
             if !selected && !self.show_other_legs {
                 continue;
             }
+            // While placing the triangle, leg 1 is drawn from the chosen time instead (see below).
+            let drawn_apart = i == 0 && self.placing_start();
             let width = if selected { 3.5 } else { 2.0 };
             let faded = |c: Color32| if selected { c } else { c.gamma_multiply(0.3) };
             let pts: Vec<(&Point, Pos2)> = leg
@@ -446,8 +620,10 @@ impl App {
                 .collect();
             if self.mode == ColorMode::Leg || !selected {
                 let line: Vec<Pos2> = pts.iter().map(|(_, s)| *s).collect();
-                painter.add(egui::Shape::line(line, Stroke::new(width, faded(Self::leg_color(i)))));
-            } else {
+                if !drawn_apart {
+                    painter.add(egui::Shape::line(line, Stroke::new(width, faded(Self::leg_color(i)))));
+                }
+            } else if !drawn_apart {
                 for w in pts.windows(2) {
                     painter.line_segment([w[0].1, w[1].1], Stroke::new(width + 0.5, self.value_color(w[1].0)));
                 }
@@ -455,6 +631,34 @@ impl App {
             if let Some((_, end)) = pts.last() {
                 painter.circle_filled(*end, 6.0, Color32::WHITE);
                 painter.circle_filled(*end, 4.5, faded(Self::leg_color(i)));
+            }
+        }
+
+        if let Some(cal) = &self.calib {
+            if let (Some(t), Some(report)) = (cal.placing, &cal.report) {
+                let pts = report.before_first_control();
+                let screen = |p: (f64, f64)| rect.min + self.offset + Vec2::new(p.0 as f32, p.1 as f32) * self.zoom;
+                // The whole track before control 1, faint; leg 1 from the chosen time, strong.
+                let all: Vec<Pos2> = pts.iter().map(|p| screen(p.page)).collect();
+                painter.add(egui::Shape::line(all, Stroke::new(1.5, Color32::from_gray(150))));
+                let k = pts.partition_point(|p| p.t <= t).saturating_sub(1).min(pts.len() - 1);
+                let mut at = pts[k].page;
+                if let Some(next) = pts.get(k + 1).filter(|n| n.t > pts[k].t) {
+                    let f = ((t - pts[k].t) / (next.t - pts[k].t)).clamp(0.0, 1.0);
+                    at = (at.0 + (next.page.0 - at.0) * f, at.1 + (next.page.1 - at.1) * f);
+                }
+                let mut line = vec![screen(at)];
+                line.extend(pts[k + 1..].iter().map(|p| screen(p.page)));
+                painter.add(egui::Shape::line(line, Stroke::new(3.5, Self::leg_color(0))));
+                if let Some(c) = cal.slots[0] {
+                    let p = screen(c);
+                    painter.circle_filled(p, 4.0, Color32::from_rgb(200, 0, 200));
+                    painter.text(p + Vec2::new(8.0, -8.0), egui::Align2::LEFT_BOTTOM, "S", egui::FontId::proportional(16.0), Color32::from_rgb(120, 0, 160));
+                }
+                let c = screen(at);
+                painter.circle_filled(c, 7.0, Color32::BLACK);
+                painter.circle_filled(c, 5.0, Color32::from_rgb(255, 230, 0));
+                return;
             }
         }
 
@@ -476,6 +680,7 @@ impl eframe::App for App {
             egui::Panel::bottom("bottom").show(ui, |ui| self.bottom_panel(ui));
         }
         egui::CentralPanel::default().show(ui, |ui| self.map_view(ui));
+        self.placement_window(&ui.ctx().clone());
     }
 }
 
