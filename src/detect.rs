@@ -484,10 +484,14 @@ mod tests {
         if let Ok(tcx) = std::env::var("VCC_TCX") {
             // Does the detected placement give a good fit of the track?
             let samples = crate::tcx::load(std::path::Path::new(&tcx)).unwrap();
-            let r = crate::calib::calibrate(&samples, &det.slots, 1.0, None, None).unwrap();
+            let r = crate::calib::calibrate(&samples, &det.slots, 1.0, None, &[], None).unwrap();
             println!("fit: mean {:.1} m, max {:.1} m", r.mean_err_m, r.max_err_m);
             for (l, e) in &r.errors_m {
                 println!("  {l}: {e:.1} m");
+            }
+            println!("lap based: {}", r.lap_based);
+            for l in &r.laps {
+                println!("  lap {:2} t={:5.0}s stop={} slot={:?}", l.id + 1, l.t, l.is_stop, l.slot);
             }
         }
         if let Ok(out) = std::env::var("VCC_OVERLAY") {

@@ -116,21 +116,38 @@ updated every time a control is placed. With only the start and the finish it is
 guess (the scale is not known); a few controls make it right. The side panel shows the mean
 and the worst error in metres: a large error usually means a misplaced click.
 
+### Watch laps
+
+A control is visited when you pressed the lap button, so every leg ends at a lap press of the
+watch, not at the track point nearest to the control (you may pass close to a control without
+being there). The app ties the controls, in order, to the lap presses that fit them best. The
+end of the recording (the stop of the watch) counts as a last press, for the finish.
+
+The lap presses are listed in the side panel ("Watch laps") and drawn on the route: a white dot
+with the number of its control, a grey `?` for a press that is not used. If you pressed lap by
+mistake, a press that belongs to no control is simply left out; if the app ties a control to the
+wrong press, untick that press in the list, or right-click it on the map, and the controls are
+tied again without it. If the file has fewer lap presses than controls, the nearest track points
+are used instead, and the panel says so.
+
+### Saving
+
 When every point is placed, press **Save CSV and view**. The app finds the scale, rotation
-and shift that put the track on your clicks, and works out when you reached each control, so
-you do not have to mark the time of each control. The small GPS drift between controls is then
-removed, so that the track goes through every control. The result is saved as a CSV file and
-opened in the viewer. **Recalibrate** goes back to the clicks, which are kept.
+and shift that put the track on your clicks, using the positions at the lap presses. The small
+GPS drift between controls is then removed, so that the track goes through every control. The
+result is saved as a CSV file and opened in the viewer. **Recalibrate** goes back to the clicks,
+which are kept, and so are the laps you ignored.
 
 Then a window asks when you were at the triangle: a slider goes from the start of the watch to
 the moment you reached control 1. Move it to the time you were at the triangle; leg 1 is drawn
 on the map from that moment. **Done** starts leg 1 there and rewrites the CSV, **Cancel** keeps
-the automatic start (the track point nearest to the triangle). The watch laps are not used.
+the automatic start: a lap pressed at the triangle if there is one, else the track point nearest
+to the triangle.
 
 Notes:
 
 - The start triangle is not a control: it only marks where leg 1 begins. Whatever the watch
   recorded before that moment is left out.
 - The legs are not independent. The scale, rotation and shift are common to the whole map,
-  and the moments of the controls are searched together, in order. Only the drift
+  and the lap presses are tied to the controls together, in order. Only the drift
   correction of a leg depends on its own two controls.

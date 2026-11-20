@@ -20,6 +20,8 @@ pub struct CalibSession {
     /// The place the next click on the map goes to.
     selected: Option<usize>,
     message: String,
+    /// Numbers of the watch laps the user does not want (pressed by mistake).
+    ignored_laps: Vec<usize>,
     /// The last fit: a preview of the route while placing, the saved result afterwards.
     report: Option<calib::Report>,
     /// While the user is placing themselves at the start triangle: the chosen time, in seconds
@@ -34,6 +36,7 @@ impl CalibSession {
             out,
             slots: vec![None; controls + 2],
             selected: Some(0),
+            ignored_laps: Vec::new(),
             message: String::new(),
             report: None,
             placing: None,
@@ -63,6 +66,16 @@ impl CalibSession {
         (k + 1..self.slots.len()).chain(0..k).find(|&i| self.slots[i].is_none())
     }
 
+    /// Ignores a lap press, or takes it back.
+    fn toggle_lap(&mut self, id: usize) {
+        match self.ignored_laps.iter().position(|&x| x == id) {
+            Some(pos) => {
+                self.ignored_laps.remove(pos);
+            }
+            None => self.ignored_laps.push(id),
+        }
+    }
+
     /// Fits the track to what is placed, to show the route. Needs the triangle and the finish.
     fn refresh_preview(&mut self, csv_to_page: f64) {
         self.placing = None;
@@ -71,7 +84,7 @@ impl CalibSession {
             self.message.clear();
             return;
         }
-        match calib::calibrate(&self.samples, &self.slots, csv_to_page, None, None) {
+        match calib::calibrate(&self.samples, &self.slots, csv_to_page, None, &self.ignored_laps, None) {
             Ok(r) => {
                 self.report = Some(r);
                 self.message.clear();
@@ -181,7 +194,7 @@ impl App {
     fn run_calibration(&mut self, start_sample: Option<usize>) {
         let Some(cal) = self.calib.as_mut() else { return };
         let csv_to_page = self.csv_to_page as f64;
-        match calib::calibrate(&cal.samples, &cal.slots, csv_to_page, start_sample, Some(&cal.out))
+        match calib::calibrate(&cal.samples, &cal.slots, csv_to_page, start_sample, &cal.ignored_laps, Some(&cal.out))
             .and_then(|r| Course::load(&cal.out).map(|c| (r, c)))
         {
             Ok((report, course)) => {
@@ -223,7 +236,7 @@ impl App {
             }
         });
         let mut clear = None;
-        egui::ScrollArea::vertical().max_height(ui.available_height() - 170.0).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("slots").max_height((ui.available_height() * 0.42).max(120.0)).show(ui, |ui| {
             egui::Grid::new("slots").num_columns(3).striped(true).show(ui, |ui| {
                 for k in 0..cal.slots.len() {
                     let placed = cal.slots[k].is_some();
@@ -240,6 +253,39 @@ impl App {
                 }
             });
         });
+        // The lap presses of the watch: each control is tied to one. Untick one pressed by mistake.
+        let mut toggle = None;
+        if let Some(r) = &cal.report {
+            ui.separator();
+            ui.label(egui::RichText::new(format!("Watch laps ({})", r.laps.len())).strong());
+            ui.label(if r.lap_based {
+                "Each control is tied to a lap press. Untick a lap pressed by mistake (or right-click it on the map)."
+            } else {
+                "Too few laps in the file: each control is tied to the nearest track point."
+            });
+            egui::ScrollArea::vertical().id_salt("laps").max_height((ui.available_height() - 130.0).max(80.0)).show(ui, |ui| {
+                egui::Grid::new("laps").num_columns(2).striped(true).show(ui, |ui| {
+                    for lap in &r.laps {
+                        let name = if lap.is_stop { "Stop".to_string() } else { format!("Lap {}", lap.id + 1) };
+                        let mut used = !lap.ignored;
+                        if ui.checkbox(&mut used, format!("{name}  {}", fmt_dur(lap.t))).changed() {
+                            toggle = Some(lap.id);
+                        }
+                        let what = match (lap.slot, lap.ignored) {
+                            (_, true) => egui::RichText::new("ignored").color(Color32::GRAY),
+                            (Some(k), _) => egui::RichText::new(format!("→ {}", cal.slot_name(k))),
+                            (None, _) => egui::RichText::new("unused").color(Color32::GRAY),
+                        };
+                        ui.label(what);
+                        ui.end_row();
+                    }
+                });
+            });
+        }
+        if let Some(id) = toggle {
+            cal.toggle_lap(id);
+            changed = true;
+        }
         if let Some(k) = clear {
             cal.slots[k] = None;
             cal.selected = Some(k);
@@ -357,6 +403,9 @@ impl App {
                 ui.label(format!("Calibration error: mean {:.0} m, max {:.0} m", r.mean_err_m, r.max_err_m));
                 ui.label(format!("Scale: {:.2} px/m, {} points", r.scale_px_per_m, r.rows));
                 ui.label(format!("Start triangle: {:.0} m from the start of leg 1", r.start_gap_m));
+                if !r.lap_based {
+                    ui.label("Control times: nearest track points (too few laps).");
+                }
                 let worst = r.errors_m.iter().max_by(|a, b| a.1.total_cmp(&b.1));
                 if let Some((l, e)) = worst {
                     ui.label(format!("Worst control: {l} ({e:.0} m)"));
@@ -549,6 +598,42 @@ impl App {
                 painter.add(egui::Shape::line(line, Stroke::new(3.0, Self::leg_color(slot - 1))));
                 from = to;
             }
+        }
+        // The watch lap presses, on the route: right-click one to ignore it (or take it back).
+        let mut toggle = None;
+        if let Some(r) = &cal.report {
+            let hover = resp.hover_pos();
+            for lap in &r.laps {
+                let p = screen(lap.page);
+                let (fill, tag) = match (lap.slot, lap.ignored) {
+                    (_, true) => (Color32::from_rgb(220, 40, 40), "✕".to_string()),
+                    (Some(k), _) => (Color32::WHITE, cal.slot_tag(k)),
+                    (None, _) => (Color32::from_gray(150), "?".to_string()),
+                };
+                painter.circle_filled(p, 6.5, Color32::BLACK);
+                painter.circle_filled(p, 5.0, fill);
+                painter.text(p + Vec2::new(8.0, 4.0), egui::Align2::LEFT_TOP, tag, egui::FontId::proportional(12.0), Color32::BLACK);
+                if hover.is_some_and(|h| h.distance(p) < 9.0) {
+                    let name = if lap.is_stop { "Stop".to_string() } else { format!("Lap {}", lap.id + 1) };
+                    let what = match (lap.slot, lap.ignored) {
+                        (_, true) => "ignored".to_string(),
+                        (Some(k), _) => format!("→ {}", cal.slot_name(k)),
+                        (None, _) => "unused".to_string(),
+                    };
+                    let text = format!("{name} at {}, {what} (right-click: {})", fmt_dur(lap.t), if lap.ignored { "use" } else { "ignore" });
+                    let galley = painter.layout_no_wrap(text, egui::FontId::proportional(13.0), Color32::WHITE);
+                    let rect = Rect::from_min_size(p + Vec2::new(10.0, -26.0), galley.size()).expand(3.0);
+                    painter.rect_filled(rect, 3.0, Color32::from_black_alpha(210));
+                    painter.galley(rect.min + Vec2::splat(3.0), galley, Color32::WHITE);
+                    if resp.secondary_clicked() {
+                        toggle = Some(lap.id);
+                    }
+                }
+            }
+        }
+        if let Some(id) = toggle {
+            cal.toggle_lap(id);
+            cal.refresh_preview(csv_to_page);
         }
         let magenta = Color32::from_rgb(200, 0, 200);
         let placed: Vec<Pos2> = cal.slots.iter().flatten().map(|c| screen(*c)).collect();

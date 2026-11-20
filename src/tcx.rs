@@ -8,6 +8,8 @@ use std::path::Path;
 pub struct Sample {
     /// Timestamp exactly as written in the file.
     pub time_utc: String,
+    /// Index of the watch lap (0-based) this sample belongs to.
+    pub lap: usize,
     /// Seconds since the first sample.
     pub t: f64,
     pub lat_lon: Option<(f64, f64)>,
@@ -65,6 +67,7 @@ pub fn load(path: &Path) -> Result<Vec<Sample>> {
     let doc = roxmltree::Document::parse(&text).context("invalid TCX (XML) file")?;
     let mut out: Vec<Sample> = Vec::new();
     let mut t0 = None;
+    let lap_ids: Vec<_> = doc.descendants().filter(|n| n.is_element() && local(n) == "Lap").map(|n| n.id()).collect();
     for tp in doc.descendants().filter(|n| n.is_element() && local(n) == "Trackpoint") {
         let Some(time) = find(tp, "Time").and_then(|n| n.text()).map(|s| s.trim().to_string()) else { continue };
         let Some(abs) = parse_time(&time) else { continue };
@@ -86,7 +89,12 @@ pub fn load(path: &Path) -> Result<Vec<Sample>> {
             _ => 0.0,
         });
         let hr = find(tp, "HeartRateBpm").and_then(|h| num(h, "Value"));
-        out.push(Sample { time_utc: time, t, lat_lon, ele: num(tp, "AltitudeMeters"), hr, dist, speed });
+        let lap = tp
+            .ancestors()
+            .find(|a| a.is_element() && local(a) == "Lap")
+            .and_then(|l| lap_ids.iter().position(|i| *i == l.id()))
+            .unwrap_or(0);
+        out.push(Sample { time_utc: time, lap, t, lat_lon, ele: num(tp, "AltitudeMeters"), hr, dist, speed });
     }
     anyhow::ensure!(!out.is_empty(), "no trackpoints in {}", path.display());
     Ok(out)
