@@ -106,12 +106,14 @@ impl Ink {
         let mut out = vec![0.0f32; w * h];
         for y in 0..h {
             for x in 1..w.saturating_sub(1) {
-                tmp[y * w + x] = (self.p[y * w + x - 1] + self.p[y * w + x] + self.p[y * w + x + 1]) / 3.0;
+                tmp[y * w + x] =
+                    (self.p[y * w + x - 1] + self.p[y * w + x] + self.p[y * w + x + 1]) / 3.0;
             }
         }
         for y in 1..h.saturating_sub(1) {
             for x in 0..w {
-                out[y * w + x] = (tmp[(y - 1) * w + x] + tmp[y * w + x] + tmp[(y + 1) * w + x]) / 3.0;
+                out[y * w + x] =
+                    (tmp[(y - 1) * w + x] + tmp[y * w + x] + tmp[(y + 1) * w + x]) / 3.0;
             }
         }
         out
@@ -152,7 +154,10 @@ fn circle_offsets(r: usize) -> Vec<(i32, i32)> {
     let mut v: Vec<(i32, i32)> = (0..n)
         .map(|k| {
             let t = k as f32 / n as f32 * std::f32::consts::TAU;
-            ((r as f32 * t.cos()).round() as i32, (r as f32 * t.sin()).round() as i32)
+            (
+                (r as f32 * t.cos()).round() as i32,
+                (r as f32 * t.sin()).round() as i32,
+            )
         })
         .collect();
     v.dedup();
@@ -198,7 +203,9 @@ fn hough(ink: &Ink, radii: &[usize]) -> (Vec<f32>, Vec<f32>) {
 /// Rings that really look like control circles, in work-image pixels.
 fn find_circles(ink: &Ink) -> Vec<Circle> {
     let r_nom = RADIUS_REL * (ink.w * ink.f) as f32 / ink.f as f32;
-    let radii: Vec<usize> = ((r_nom * 0.7) as usize..=(r_nom * 1.35) as usize).step_by(3).collect();
+    let radii: Vec<usize> = ((r_nom * 0.7) as usize..=(r_nom * 1.35) as usize)
+        .step_by(3)
+        .collect();
     let (best, best_r) = hough(ink, &radii);
 
     // Greedy non-maximum suppression of the Hough peaks.
@@ -239,7 +246,13 @@ fn find_circles(ink: &Ink) -> Vec<Circle> {
                     }
                     let score = cover - 3.0 * inside;
                     if top.as_ref().is_none_or(|t| score > t.score) {
-                        top = Some(Circle { x, y, r, score, inner: 0.0 });
+                        top = Some(Circle {
+                            x,
+                            y,
+                            r,
+                            score,
+                            inner: 0.0,
+                        });
                     }
                 }
             }
@@ -248,9 +261,15 @@ fn find_circles(ink: &Ink) -> Vec<Circle> {
         if c.score < MIN_SCORE {
             continue;
         }
-        c.inner = (0.55..=0.8).step_by_f(0.05).map(|k| ink.ring_cover(c.x, c.y, c.r * k)).fold(0.0, f32::max);
+        c.inner = (0.55..=0.8)
+            .step_by_f(0.05)
+            .map(|k| ink.ring_cover(c.x, c.y, c.r * k))
+            .fold(0.0, f32::max);
         // Two peaks can settle on the same circle.
-        match circles.iter_mut().find(|o| (o.x - c.x).hypot(o.y - c.y) < c.r * 0.5) {
+        match circles
+            .iter_mut()
+            .find(|o| (o.x - c.x).hypot(o.y - c.y) < c.r * 0.5)
+        {
             Some(o) => {
                 if c.score > o.score {
                     *o = c;
@@ -314,7 +333,19 @@ fn hop_score(ink: &Ink, a: &Circle, b: &Circle) -> f32 {
 /// Returns indices into `ctrl`. The finish being at the end is what gives the direction.
 fn order(ink: &Ink, ctrl: &[Circle], fin: &Circle) -> Vec<usize> {
     let n = ctrl.len();
-    let w: Vec<Vec<f32>> = (0..n).map(|i| (0..n).map(|j| if i == j { 0.0 } else { hop_score(ink, &ctrl[i], &ctrl[j]) }).collect()).collect();
+    let w: Vec<Vec<f32>> = (0..n)
+        .map(|i| {
+            (0..n)
+                .map(|j| {
+                    if i == j {
+                        0.0
+                    } else {
+                        hop_score(ink, &ctrl[i], &ctrl[j])
+                    }
+                })
+                .collect()
+        })
+        .collect();
     let wf: Vec<f32> = ctrl.iter().map(|c| hop_score(ink, c, fin)).collect();
     // dp[mask][last]: best total score of a path through the set `mask`, ending at `last`.
     let size = 1usize << n;
@@ -342,7 +373,9 @@ fn order(ink: &Ink, ctrl: &[Circle], fin: &Circle) -> Vec<usize> {
         }
     }
     let full = size - 1;
-    let last = (0..n).max_by(|&a, &b| (dp[full * n + a] + wf[a]).total_cmp(&(dp[full * n + b] + wf[b]))).unwrap_or(0);
+    let last = (0..n)
+        .max_by(|&a, &b| (dp[full * n + a] + wf[a]).total_cmp(&(dp[full * n + b] + wf[b])))
+        .unwrap_or(0);
     let mut path = vec![last];
     let (mut mask, mut cur) = (full, last);
     while from[mask * n + cur] != u8::MAX {
@@ -368,10 +401,15 @@ fn follow_line(ink: &Ink, c: &Circle, t: f32) -> (f32, (f32, f32)) {
         len += 1.0;
         let (ux, uy) = (h.cos(), h.sin());
         // Where is the ink across the line? Follow it.
-        let across: Vec<f32> = (-4..=4).map(|k| k as f32).filter(|k| ink.at(x - uy * k, y + ux * k) > LINE_INK).collect();
-        let clear = ink.at(x - uy * 8.0, y + ux * 8.0) < INK || ink.at(x + uy * 8.0, y - ux * 8.0) < INK;
+        let across: Vec<f32> = (-4..=4)
+            .map(|k| k as f32)
+            .filter(|k| ink.at(x - uy * k, y + ux * k) > LINE_INK)
+            .collect();
+        let clear =
+            ink.at(x - uy * 8.0, y + ux * 8.0) < INK || ink.at(x + uy * 8.0, y - ux * 8.0) < INK;
         // Ink on both sides of the line: the triangle (or something else) starts here.
-        let both_sides = ink.at(x - uy * 6.0, y + ux * 6.0) > INK && ink.at(x + uy * 6.0, y - ux * 6.0) > INK;
+        let both_sides =
+            ink.at(x - uy * 6.0, y + ux * 6.0) > INK && ink.at(x + uy * 6.0, y - ux * 6.0) > INK;
         if both_sides && len > c.r + 10.0 {
             break;
         }
@@ -397,7 +435,8 @@ fn find_start(ink: &Ink, c1: &Circle, c2: &Circle) -> Option<(f32, f32)> {
     let mut best: Option<(f32, (f32, f32))> = None;
     for k in 0..180 {
         let t = k as f32 / 180.0 * std::f32::consts::TAU;
-        let diff = (t - to_c2 + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+        let diff = (t - to_c2 + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+            - std::f32::consts::PI;
         if diff.abs() < 0.25 {
             continue;
         }
@@ -416,31 +455,97 @@ fn find_start(ink: &Ink, c1: &Circle, c2: &Circle) -> Option<(f32, f32)> {
 }
 
 /// Proposes a placement of the start, `n_controls` controls and the finish on the map.
+/// The control circles seen on the map, to guess how many controls the course has.
+pub struct Scan {
+    /// Circles that look like controls or the finish, in page pixels.
+    pub circles: Vec<Circle>,
+    /// Index in `circles` of the finish (the circle with a second ring inside), if found.
+    pub finish: Option<usize>,
+}
+
+impl Scan {
+    /// Number of controls, the finish not included. `None` when the finish was not found.
+    pub fn controls(&self) -> Option<usize> {
+        self.finish.map(|_| self.circles.len() - 1)
+    }
+}
+
+/// Looks for the circles of the course. A weak circle is kept only if it has the size of the sure ones: the
+/// small rings and arcs of the map symbols are not controls.
+pub fn scan(page: &PageImage) -> Scan {
+    let ink = Ink::new(page);
+    let f = ink.f as f32;
+    let all = find_circles(&ink);
+    let mut sure: Vec<f32> = all.iter().filter(|c| c.score >= 0.8).map(|c| c.r).collect();
+    sure.sort_by(f32::total_cmp);
+    let Some(&median) = sure.get(sure.len() / 2) else {
+        return Scan { circles: Vec::new(), finish: None };
+    };
+    let circles: Vec<Circle> = all
+        .iter()
+        .filter(|c| c.score >= 0.6 && c.r >= 0.85 * median && c.r <= 1.3 * median)
+        .map(|c| Circle { x: (c.x + 0.5) * f, y: (c.y + 0.5) * f, r: c.r * f, ..c.clone() })
+        .collect();
+    let finish = (0..circles.len())
+        .max_by(|&a, &b| circles[a].inner.total_cmp(&circles[b].inner))
+        .filter(|&i| circles[i].inner > 0.5);
+    Scan { circles, finish }
+}
+
 pub fn detect(page: &PageImage, n_controls: usize) -> Detection {
     let mut slots: Vec<Option<V>> = vec![None; n_controls + 2];
     let ink = Ink::new(page);
     let circles = find_circles(&ink);
-    let to_page = |x: f32, y: f32| ((x as f64 + 0.5) * ink.f as f64, (y as f64 + 0.5) * ink.f as f64);
+    let to_page = |x: f32, y: f32| {
+        (
+            (x as f64 + 0.5) * ink.f as f64,
+            (y as f64 + 0.5) * ink.f as f64,
+        )
+    };
     let scaled: Vec<Circle> = circles
         .iter()
-        .map(|c| Circle { x: (c.x + 0.5) * ink.f as f32, y: (c.y + 0.5) * ink.f as f32, r: c.r * ink.f as f32, ..c.clone() })
+        .map(|c| Circle {
+            x: (c.x + 0.5) * ink.f as f32,
+            y: (c.y + 0.5) * ink.f as f32,
+            r: c.r * ink.f as f32,
+            ..c.clone()
+        })
         .collect();
-    let mut det = Detection { slots: slots.clone(), circles: scaled, note: String::new() };
+    let mut det = Detection {
+        slots: slots.clone(),
+        circles: scaled,
+        note: String::new(),
+    };
 
     // The finish has a second ring inside.
-    let Some(fin_i) = (0..circles.len()).max_by(|&a, &b| circles[a].inner.total_cmp(&circles[b].inner)).filter(|&i| circles[i].inner > 0.5)
+    let Some(fin_i) = (0..circles.len())
+        .max_by(|&a, &b| circles[a].inner.total_cmp(&circles[b].inner))
+        .filter(|&i| circles[i].inner > 0.5)
     else {
-        det.note = format!("Auto-placement: {} circles found, but not the finish (double circle).", circles.len());
+        det.note = format!(
+            "Placement automatique : {} cercles trouvés, mais pas l'arrivée (double cercle).",
+            circles.len()
+        );
         return det;
     };
     let fin = circles[fin_i].clone();
-    let ctrl: Vec<Circle> = circles.iter().enumerate().filter(|&(i, _)| i != fin_i).map(|(_, c)| c.clone()).take(n_controls).collect();
+    let ctrl: Vec<Circle> = circles
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != fin_i)
+        .map(|(_, c)| c.clone())
+        .take(n_controls)
+        .collect();
     if ctrl.len() < n_controls {
-        det.note = format!("Auto-placement: found {} of {} controls, nothing placed.", ctrl.len(), n_controls);
+        det.note = format!(
+            "Placement automatique : {} postes trouvés sur {}, rien n'est placé.",
+            ctrl.len(),
+            n_controls
+        );
         return det;
     }
     if n_controls > MAX_CONTROLS {
-        det.note = format!("Auto-placement: too many controls (more than {MAX_CONTROLS}).");
+        det.note = format!("Placement automatique : trop de postes (plus de {MAX_CONTROLS}).");
         return det;
     }
     let path = order(&ink, &ctrl, &fin);
@@ -448,12 +553,20 @@ pub fn detect(page: &PageImage, n_controls: usize) -> Detection {
         slots[k + 1] = Some(to_page(ctrl[i].x, ctrl[i].y));
     }
     slots[n_controls + 1] = Some(to_page(fin.x, fin.y));
-    let start = find_start(&ink, &ctrl[path[0]], &ctrl[*path.get(1).unwrap_or(&path[0])]);
+    let start = find_start(
+        &ink,
+        &ctrl[path[0]],
+        &ctrl[*path.get(1).unwrap_or(&path[0])],
+    );
     slots[0] = start.map(|(x, y)| to_page(x, y));
     det.note = format!(
-        "Auto-placement: {} controls and the finish found{}; check the order and move what is wrong.",
+        "Placement automatique : {} postes et l'arrivée trouvés{} ; vérifiez l'ordre et déplacez ce qui est faux.",
         n_controls,
-        if start.is_some() { ", and the triangle" } else { " (triangle not found)" },
+        if start.is_some() {
+            ", et le triangle"
+        } else {
+            " (triangle introuvable)"
+        },
     );
     det.slots = slots;
     det
@@ -472,11 +585,16 @@ mod tests {
         let n: usize = std::env::var("VCC_N").unwrap().parse().unwrap();
         let map = crate::pdf::load_map(std::path::Path::new(&pdf), 4096).unwrap();
         let t = std::time::Instant::now();
+        let sc = scan(&map.image);
+        println!("scan: {} circles, controls = {:?}", sc.circles.len(), sc.controls());
         let det = detect(&map.image, n);
         println!("detection took {:?}", t.elapsed());
         println!("{}", det.note);
         for c in &det.circles {
-            println!("circle x={:.0} y={:.0} r={:.0} score={:.2} inner={:.2}", c.x, c.y, c.r, c.score, c.inner);
+            println!(
+                "circle x={:.0} y={:.0} r={:.0} score={:.2} inner={:.2}",
+                c.x, c.y, c.r, c.score, c.inner
+            );
         }
         for (k, s) in det.slots.iter().enumerate() {
             println!("slot {k}: {s:?}");
@@ -484,24 +602,38 @@ mod tests {
         if let Ok(tcx) = std::env::var("VCC_TCX") {
             // Does the detected placement give a good fit of the track?
             let samples = crate::tcx::load(std::path::Path::new(&tcx)).unwrap();
-            let r = crate::calib::calibrate(&samples, &det.slots, 1.0, None, false, &[], None).unwrap();
+            let r =
+                crate::calib::calibrate(&samples, &det.slots, 1.0, None, false, &[], &Default::default(), false).unwrap();
             println!("fit: mean {:.1} m, max {:.1} m", r.mean_err_m, r.max_err_m);
             for (l, e) in &r.errors_m {
                 println!("  {l}: {e:.1} m");
             }
             println!("lap based: {}", r.lap_based);
             for l in &r.laps {
-                println!("  lap {:2} t={:5.0}s stop={} slot={:?}", l.id + 1, l.t, l.is_stop, l.slot);
+                println!(
+                    "  lap {:2} t={:5.0}s stop={} slot={:?}",
+                    l.id + 1,
+                    l.t,
+                    l.is_stop,
+                    l.slot
+                );
             }
         }
         if let Ok(out) = std::env::var("VCC_OVERLAY") {
             let img = &map.image;
-            let mut im = image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.rgba.clone()).unwrap();
+            let mut im =
+                image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.rgba.clone())
+                    .unwrap();
             let mut dot = |x: f64, y: f64, rad: i32, col: [u8; 4]| {
                 for dy in -rad..=rad {
                     for dx in -rad..=rad {
                         let (px, py) = (x as i32 + dx, y as i32 + dy);
-                        if dx * dx + dy * dy <= rad * rad && px >= 0 && py >= 0 && (px as u32) < im.width() && (py as u32) < im.height() {
+                        if dx * dx + dy * dy <= rad * rad
+                            && px >= 0
+                            && py >= 0
+                            && (px as u32) < im.width()
+                            && (py as u32) < im.height()
+                        {
                             im.put_pixel(px as u32, py as u32, image::Rgba(col));
                         }
                     }
@@ -510,18 +642,34 @@ mod tests {
             for c in &det.circles {
                 for k in 0..360 {
                     let t = (k as f32).to_radians();
-                    dot((c.x + c.r * t.cos()) as f64, (c.y + c.r * t.sin()) as f64, 2, [0, 120, 255, 255]);
+                    dot(
+                        (c.x + c.r * t.cos()) as f64,
+                        (c.y + c.r * t.sin()) as f64,
+                        2,
+                        [0, 120, 255, 255],
+                    );
                 }
             }
             let placed: Vec<V> = det.slots.iter().flatten().copied().collect();
             for w in placed.windows(2) {
                 for k in 0..200 {
                     let f = k as f64 / 200.0;
-                    dot(w[0].0 + (w[1].0 - w[0].0) * f, w[0].1 + (w[1].1 - w[0].1) * f, 2, [0, 0, 0, 255]);
+                    dot(
+                        w[0].0 + (w[1].0 - w[0].0) * f,
+                        w[0].1 + (w[1].1 - w[0].1) * f,
+                        2,
+                        [0, 0, 0, 255],
+                    );
                 }
             }
             for (k, p) in placed.iter().enumerate() {
-                let col = if k == 0 { [0, 200, 0, 255] } else if k + 1 == placed.len() { [255, 0, 0, 255] } else { [255, 220, 0, 255] };
+                let col = if k == 0 {
+                    [0, 200, 0, 255]
+                } else if k + 1 == placed.len() {
+                    [255, 0, 0, 255]
+                } else {
+                    [255, 220, 0, 255]
+                };
                 dot(p.0, p.1, 6 + 3 * k as i32 / 2, col);
             }
             im.save(out).unwrap();

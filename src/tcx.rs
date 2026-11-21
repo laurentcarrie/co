@@ -63,14 +63,34 @@ pub fn haversine_m(a: (f64, f64), b: (f64, f64)) -> f64 {
 }
 
 pub fn load(path: &Path) -> Result<Vec<Sample>> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    let doc = roxmltree::Document::parse(&text).context("invalid TCX (XML) file")?;
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("impossible de lire {}", path.display()))?;
+    parse(&text)
+}
+
+/// Reads the trackpoints of a TCX file given as text.
+pub fn parse(text: &str) -> Result<Vec<Sample>> {
+    let doc = roxmltree::Document::parse(text).context("fichier TCX (XML) invalide")?;
     let mut out: Vec<Sample> = Vec::new();
     let mut t0 = None;
-    let lap_ids: Vec<_> = doc.descendants().filter(|n| n.is_element() && local(n) == "Lap").map(|n| n.id()).collect();
-    for tp in doc.descendants().filter(|n| n.is_element() && local(n) == "Trackpoint") {
-        let Some(time) = find(tp, "Time").and_then(|n| n.text()).map(|s| s.trim().to_string()) else { continue };
-        let Some(abs) = parse_time(&time) else { continue };
+    let lap_ids: Vec<_> = doc
+        .descendants()
+        .filter(|n| n.is_element() && local(n) == "Lap")
+        .map(|n| n.id())
+        .collect();
+    for tp in doc
+        .descendants()
+        .filter(|n| n.is_element() && local(n) == "Trackpoint")
+    {
+        let Some(time) = find(tp, "Time")
+            .and_then(|n| n.text())
+            .map(|s| s.trim().to_string())
+        else {
+            continue;
+        };
+        let Some(abs) = parse_time(&time) else {
+            continue;
+        };
         let t = abs - *t0.get_or_insert(abs);
         let lat_lon = match (num(tp, "LatitudeDegrees"), num(tp, "LongitudeDegrees")) {
             (Some(a), Some(b)) => Some((a, b)),
@@ -94,8 +114,17 @@ pub fn load(path: &Path) -> Result<Vec<Sample>> {
             .find(|a| a.is_element() && local(a) == "Lap")
             .and_then(|l| lap_ids.iter().position(|i| *i == l.id()))
             .unwrap_or(0);
-        out.push(Sample { time_utc: time, lap, t, lat_lon, ele: num(tp, "AltitudeMeters"), hr, dist, speed });
+        out.push(Sample {
+            time_utc: time,
+            lap,
+            t,
+            lat_lon,
+            ele: num(tp, "AltitudeMeters"),
+            hr,
+            dist,
+            speed,
+        });
     }
-    anyhow::ensure!(!out.is_empty(), "no trackpoints in {}", path.display());
+    anyhow::ensure!(!out.is_empty(), "aucun point de trace dans le fichier TCX");
     Ok(out)
 }

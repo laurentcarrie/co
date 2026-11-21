@@ -8,15 +8,19 @@ Written in Rust with [egui](https://github.com/emilk/egui).
 
 ## Features
 
+- The interface is in French. The **? Aide** button, on every screen, opens a help window (in
+  French too) that explains the screen you are on. The command-line help and this README are in
+  English.
 - Zoom (mouse wheel) and pan (drag) on the map.
 - Select one leg: the view zooms on it, other legs can be faded or hidden.
 - Per-leg statistics: duration, run length, bird length (straight line between the
   controls), run / bird ratio, average pace.
-- Colour the selected leg by pace or by heart rate.
+- Colour the selected leg by pace or by heart rate, with min and max sliders for the colour scale.
+- Slider for the width of the track line.
 - Slider along the selected leg, in metres: a dot moves on the map and the time, distance,
   pace, elevation and heart rate at that point are shown, with an elevation profile.
 - Calibration mode: click the controls on the map and the Garmin `.tcx` file is placed on
-  the map for you; a CSV file is generated.
+  the map for you; the race is saved as one zip file.
 
 ## Build
 
@@ -34,55 +38,89 @@ fallback, if installed.
 
 ## Input files
 
-### The map: a PDF
+### The map: a PDF or an image
 
-The map of the race, as a scanned PDF. Only the first page is used, and the map should be
-north-up.
+The map of the race, as a scanned PDF (only the first page is used), or as a scan saved as a PNG,
+JPEG or TIFF image. The map should be north-up.
 
 ### The track
 
-Either a CSV file (`--csv`), for example one produced by another tool, or a Garmin `.tcx`
-file (`--tcx`) that is calibrated on the map first (see [Calibration](#calibration)).
+A Garmin `.tcx` file exported by the watch. It is placed on the map by clicking the controls (see
+[Calibration](#calibration)).
 
-CSV columns (header names matter, order does not):
+### The saved race
 
-| column | required | meaning |
-| --- | --- | --- |
-| `elapsed_s` | yes | seconds since the start of the recording |
-| `to_control` | yes | leg label of the row: `1`, `2`, ..., `F`. Rows with an empty label (before the start, after the finish) are ignored |
-| `distance_m` | yes | cumulative distance in metres |
-| `x_px_fit`, `y_px_fit` | for the map | position on the map, in pixels of the scan. `x_px`, `y_px` are used if the `_fit` columns are missing. Rows without a position are not drawn |
-| `lat`, `lon` | no | needed for the bird length |
-| `elevation_m` | no | elevation |
-| `heart_rate` | no | heart rate, in bpm |
-| `speed_ms` | no | speed in m/s, used for the pace |
+A race is saved as one zip file, `<date>-<name>.zip` (for example
+`2026-11-15-rocher-dame-jouanne.zip`), with:
 
-A leg is a run of consecutive rows with the same `to_control`.
+- `map.pdf` (or `map.png`, `map.jpg`, `map.tif`): the map;
+- `race.tcx`: the track of the watch;
+- `transformation.yml`: how the track sits on the map, and the choices that led to it.
 
-The pixel coordinates refer to the scan embedded in the PDF, at its native size. If your
-file uses another size, pass `--csv-width`.
+The legs are not stored: they are computed from these files when the race is opened.
+
+`transformation.yml` holds:
+
+| key | meaning |
+| --- | --- |
+| `race` | name, date, number of controls |
+| `sources` | file names, SHA-256 and sizes of the map and the track, to check that they match |
+| `projection` | the flat projection from GPS to metres: `X = (lon - lon0) * cos(lat0) * R` (east), `Y = -(lat - lat0) * R` (south) |
+| `similarity` | metres to map pixels, `w = a * z + b` as complex numbers (scale, rotation, shift). Derived: written for other tools, recomputed on opening |
+| `points` | where you placed the triangle, the controls and the finish, in pixels of the map image |
+| `watch` | your decisions: lap pressed at the triangle, when you passed the triangle (seconds), ignored laps, laps you moved (seconds) |
+| `visits` | when the watch was at the start and at each control and the finish, in seconds since the first point of the track. Derived |
+
+Times are seconds since the first point of the track. Laps are numbered from 1, as in the app.
+To get millimetres on paper from the map pixels, divide by the resolution of the scan:
+`mm = px * 25.4 / dpi`.
 
 ## Usage
 
-```sh
-# view a track given as a CSV (no calibration)
-visu-course-co map.pdf --csv track.csv
+### Start menu
 
-# calibrate a .tcx on the map, write the CSV, then view it
-visu-course-co map.pdf --tcx race.tcx
+Run `visu-course-co` without arguments (or start it from the desktop): a menu asks for
+
+- the **map**: a PDF or a scanned image (PNG, JPEG, TIFF), with a **Search…** button;
+- the **track**: the Garmin `.tcx` file, with a **Search…** button;
+- the **date**, read from the track (`YYYY-MM-DD`, the day of the first point, as written in the
+  file, in UTC);
+- the **name of the map**, which you type. It is guessed from the name of the map file when that
+  is `<date>-<name>`. **Guess…** asks OpenStreetMap for the name of the place of the track: it
+  sends one position over the network (the middle of the track, rounded to about 100 m), and
+  only when you press it;
+- the folder to **save in**, created if missing.
+
+The race is saved in that folder as `<date>-<name>.zip`, with the name written in lower case,
+without accents, words joined by `-`. The menu shows the file name before you press **Start**, and
+says when it already exists and will be replaced. Nothing is written until you press **Save**.
+Then the calibration starts, as described below, and a window asks how many controls the course
+has (the circles seen on the map give the number to suggest).
+
+**Open a saved race (.zip)…** loads a race that was saved: the map, the track and your choices are
+read back and you arrive in view mode.
+
+### Command line
+
+```sh
+# open a saved race
+visu-course-co 2026-11-15-rocher-dame-jouanne.zip
+
+# start a new race: calibrate a .tcx on the map
+visu-course-co map.pdf --tcx race.tcx --name "rocher dame jouanne"
 ```
 
-Give exactly one of `--csv` and `--tcx`.
+The map can be a PDF or a PNG, JPEG or TIFF image.
 
-Options:
+Options (for a new race):
 
 | option | meaning |
 | --- | --- |
-| `--csv <file>` | the track as a CSV file, shown as is |
-| `--tcx <file>` | a Garmin `.tcx` file, to calibrate on the map first |
-| `--controls <N>` | with `--tcx`, the number of controls of the course, the finish not included (default 10) |
-| `--out <file>` | with `--tcx`, where to write the CSV (default: `<tcx name>-legs.csv` next to it) |
-| `--csv-width <px>` | width in pixels of the page image the CSV coordinates refer to (default: the size of the scan in the PDF) |
+| `--tcx <file>` | the Garmin `.tcx` file, to calibrate on the map |
+| `--name <name>` | the name of the race (default: guessed from the map file name) |
+| `--out <file>` | where to save the zip (default: `<date>-<name>.zip` next to the `.tcx`) |
+| `--controls <N>` | the number of controls of the course, the finish not included (if not given, a window asks for it at start) |
+| `--lookup-place` | when no `--name` is given, ask OpenStreetMap for the name of the place of the track (a village or town near it). This is the only use of the network: it sends one position, the middle of the track rounded to about 100 m. It is not the name printed on the map |
 | `--render-width <px>` | width used to render the PDF when the poppler fallback is needed (default 4096) |
 
 ### Viewer
@@ -94,15 +132,16 @@ Options:
 
 ## Calibration
 
-Starting from a `.tcx` file (`--tcx`), the app needs to know where the track is on the map.
+Starting from a `.tcx` file, the app needs to know where the track is on the map.
 The side panel lists the **Triangle** (the start), the controls **1, 2, 3, ...** and the **Finish**,
-all grey at first. Give the number of controls with `--controls <N>` (default 10), or use
+all grey at first. A window asks how many controls the course has, with the number of circles seen on the map as the
+suggestion (or give `--controls <N>`); change it later with
 **+** / **−**.
 
 At start the app looks for the course printed on the map (pink or purple circles, the double
 circle of the finish, the lines between them and the start triangle) and fills the list with a
 first guess: the route is already drawn. Check each point and correct what is wrong, as below.
-The note under the list says what was found. The detection needs `--controls` to be right, and
+The note under the list says what was found. The detection needs the number of controls to be right, and
 a legible overprint; if it cannot find everything, nothing is placed and you click the points
 yourself. The order comes from the lines between the circles, so check it where two circles
 are close to each other.
@@ -132,13 +171,13 @@ are used instead, and the panel says so.
 
 ### Saving
 
-When every point is placed, press **Save CSV**. The app finds the scale, rotation
+When every point is placed, press **Save**. The app finds the scale, rotation
 and shift that put the track on your clicks, using the positions at the lap presses. The small
 GPS drift between controls is then removed, so that the track goes through every control. The
-result is saved as a CSV file, and you stay on the calibration screen. **Open viewer** then shows
-the legs (duration, length, pace, heart rate); it needs a saved CSV, and says when changes have
-not been saved yet. **Recalibrate**, in the viewer, goes back to the clicks, which are kept, and
-so are the laps you ignored.
+race is saved as the zip file (map, track and transformation), and you stay on the calibration
+screen. **VISUALISATION** then shows the legs (duration, length, pace, heart rate), and says when
+changes have not been saved yet. **ÉDITION** goes back to the clicks, which are kept, and so are
+the laps you ignored or moved.
 
 ### The triangle
 
@@ -149,14 +188,14 @@ controls):
   tied to a lap press like every control (the first one, before control 1), so the time at the
   triangle is known and leg 1 starts at that press. The list of laps shows `→ Triangle`.
 - **Not ticked:** the triangle only marks where leg 1 begins, and you give the time yourself. Press
-  **When did I pass the triangle?**, next to **Save CSV** while calibrating (once the route is
+  **When did I pass the triangle?**, next to **Save** while calibrating (once the route is
   drawn), or in the side panel of the viewer. A window opens with a slider from the start of the
   watch to the moment you reached control 1. Move it to the time you were at the triangle: the
   track point at that time is put on the triangle, and leg 1 is redrawn from there (the drift is
   spread up to control 1). If the triangle itself is misplaced, press **Place the triangle** and
-  click its place on the map. **Done** starts leg 1 at the chosen time and writes the CSV (when
-  calibrating, it saves and stays on the calibration screen), **Cancel** keeps the automatic start,
-  the track point nearest to the triangle. The button needs a `--tcx` session.
+  click its place on the map. **Done** starts leg 1 at the chosen time and saves (when
+  calibrating, it stays on the calibration screen), **Cancel** keeps the automatic start,
+  the track point nearest to the triangle. 
 
 Notes:
 

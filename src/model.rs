@@ -1,7 +1,6 @@
 //! Track data loaded from the CSV: points grouped into legs, with per-leg stats.
 
 use anyhow::{Context, Result};
-use std::path::Path;
 
 #[derive(Clone, Debug)]
 pub struct Point {
@@ -46,7 +45,9 @@ impl Leg {
     /// Index of the last trackpoint reached after `d` metres from the leg start.
     pub fn index_at(&self, d: f64) -> usize {
         let d0 = self.points[0].dist;
-        self.points.partition_point(|p| p.dist - d0 <= d).saturating_sub(1)
+        self.points
+            .partition_point(|p| p.dist - d0 <= d)
+            .saturating_sub(1)
     }
 
     /// Map position after `d` metres from the leg start, interpolated between trackpoints.
@@ -55,7 +56,8 @@ impl Leg {
         let a = &self.points[k];
         if let (Some(pa), Some(b)) = (a.px, self.points.get(k + 1)) {
             if let Some(pb) = b.px.filter(|_| b.dist > a.dist) {
-                let f = ((d + self.points[0].dist - a.dist) / (b.dist - a.dist)).clamp(0.0, 1.0) as f32;
+                let f =
+                    ((d + self.points[0].dist - a.dist) / (b.dist - a.dist)).clamp(0.0, 1.0) as f32;
                 return Some((pa.0 + (pb.0 - pa.0) * f, pa.1 + (pb.1 - pa.1) * f));
             }
         }
@@ -70,7 +72,11 @@ impl Leg {
             (Some(a), Some(b)) => Some(haversine_m(a, b)),
             _ => None,
         };
-        LegStats { duration_s: last.t - first.t, run_m: last.dist - first.dist, bird_m }
+        LegStats {
+            duration_s: last.t - first.t,
+            run_m: last.dist - first.dist,
+            bird_m,
+        }
     }
 }
 
@@ -93,6 +99,8 @@ fn haversine_m(a: (f64, f64), b: (f64, f64)) -> f64 {
 
 pub struct Course {
     pub legs: Vec<Leg>,
+    /// What was recorded before the first leg (before the triangle), kept to draw it. Not part of any leg.
+    pub lead_in: Vec<Point>,
 }
 
 fn num(rec: &csv::StringRecord, i: Option<usize>) -> Option<f64> {
@@ -105,7 +113,11 @@ fn smooth(v: &[Option<f64>], w: usize) -> Vec<f64> {
         .map(|i| {
             let (a, b) = (i.saturating_sub(w), (i + w + 1).min(v.len()));
             let xs: Vec<f64> = v[a..b].iter().flatten().copied().collect();
-            if xs.is_empty() { 0.0 } else { xs.iter().sum::<f64>() / xs.len() as f64 }
+            if xs.is_empty() {
+                0.0
+            } else {
+                xs.iter().sum::<f64>() / xs.len() as f64
+            }
         })
         .collect()
 }
@@ -113,15 +125,19 @@ fn smooth(v: &[Option<f64>], w: usize) -> Vec<f64> {
 impl Course {
     /// A course without any leg (used while calibrating).
     pub fn empty() -> Self {
-        Course { legs: Vec::new() }
+        Course {
+            legs: Vec::new(),
+            lead_in: Vec::new(),
+        }
     }
 
-    pub fn load(path: &Path) -> Result<Self> {
-        let mut rdr = csv::Reader::from_path(path)
-            .with_context(|| format!("cannot open {}", path.display()))?;
+    /// Reads the legs from CSV text, as built by the calibration.
+    pub fn from_csv(data: &[u8]) -> Result<Self> {
+        let mut rdr = csv::Reader::from_reader(data);
         let headers = rdr.headers()?.clone();
         let col = |name: &str| headers.iter().position(|h| h == name);
-        let need = |name: &str| col(name).with_context(|| format!("missing CSV column `{name}`"));
+        let need =
+            |name: &str| col(name).with_context(|| format!("colonne CSV manquante : `{name}`"));
 
         let (c_t, c_leg, c_dist) = (need("elapsed_s")?, need("to_control")?, need("distance_m")?);
         let (c_lat, c_lon) = (col("lat"), col("lon"));
@@ -135,11 +151,26 @@ impl Course {
         let mut names: Vec<String> = Vec::new();
         let mut groups: Vec<Vec<Point>> = Vec::new();
         let mut raw_speed: Vec<Vec<Option<f64>>> = Vec::new();
+        let mut lead_in: Vec<Point> = Vec::new();
         for rec in rdr.records() {
             let rec = rec?;
             let name = rec.get(c_leg).unwrap_or("").trim().to_string();
             if name.is_empty() {
-                continue; // before the start or after the finish
+                // Before the start or after the finish. What comes before the start is kept to be drawn.
+                if names.is_empty() {
+                    if let (Some(x), Some(y)) = (num(&rec, c_x), num(&rec, c_y)) {
+                        lead_in.push(Point {
+                            t: num(&rec, Some(c_t)).unwrap_or(0.0),
+                            dist: num(&rec, Some(c_dist)).unwrap_or(0.0),
+                            ele: None,
+                            hr: None,
+                            speed: 0.0,
+                            lat_lon: None,
+                            px: Some((x as f32, y as f32)),
+                        });
+                    }
+                }
+                continue;
             }
             if names.last() != Some(&name) {
                 names.push(name);
@@ -173,17 +204,25 @@ impl Course {
             }
             legs.push(Leg { name, points });
         }
-        anyhow::ensure!(!legs.is_empty(), "no data rows in {}", path.display());
-        Ok(Course { legs })
+        anyhow::ensure!(!legs.is_empty(), "aucune ligne de données");
+        Ok(Course { legs, lead_in })
     }
 
     /// 5th and 95th percentile of an attribute over all points, for colour scales.
     pub fn range(&self, f: impl Fn(&Point) -> Option<f64>) -> (f64, f64) {
-        let mut v: Vec<f64> = self.legs.iter().flat_map(|l| l.points.iter()).filter_map(&f).collect();
+        let mut v: Vec<f64> = self
+            .legs
+            .iter()
+            .flat_map(|l| l.points.iter())
+            .filter_map(&f)
+            .collect();
         if v.is_empty() {
             return (0.0, 1.0);
         }
         v.sort_by(|a, b| a.total_cmp(b));
-        (v[v.len() * 5 / 100], v[(v.len() * 95 / 100).min(v.len() - 1)])
+        (
+            v[v.len() * 5 / 100],
+            v[(v.len() * 95 / 100).min(v.len() - 1)],
+        )
     }
 }
