@@ -1033,7 +1033,7 @@ impl App {
                 )
             })
             .inner
-            .on_hover_text("Enregistre la carte avec la course dessinée, en PDF, à côté du fichier zip")
+            .on_hover_text("Enregistre la carte avec la course dessinée, en PDF (nom-export.pdf), à côté du fichier zip")
             .on_disabled_hover_text("Enregistrez d'abord la course")
             .clicked();
         if export {
@@ -1064,7 +1064,9 @@ impl App {
     /// Saves the map with the legs drawn on it as a PDF, next to the zip, with the same name.
     fn export_pdf(&mut self) {
         let Some(cal) = &self.calib else { return };
-        let path = cal.save.zip.with_extension("pdf");
+        // Not `<name>.pdf`: that is often the name of the map file, which must not be overwritten.
+        let stem = cal.save.zip.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let path = cal.save.zip.with_file_name(format!("{stem}-export.pdf"));
         let color = |i: usize| {
             let c = Self::leg_color(i);
             [c.r(), c.g(), c.b()]

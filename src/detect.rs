@@ -28,6 +28,8 @@ const MIN_SCORE: f32 = 0.45;
 const MAX_INSIDE: f32 = 0.1;
 /// A printed line covering at least this share of the way between two circles links them.
 const MIN_LEG_COVER: f32 = 0.65;
+/// How far (radians) a line may turn from the direction it left the circle in, when it is followed.
+const MAX_TURN: f32 = 0.2;
 /// Most controls whose order is searched (the search is exponential).
 const MAX_CONTROLS: usize = 20;
 
@@ -420,7 +422,8 @@ fn follow_line(ink: &Ink, c: &Circle, t: f32) -> (f32, (f32, f32)) {
         let k = across.iter().sum::<f32>() / across.len() as f32;
         x -= uy * 0.5 * k;
         y += ux * 0.5 * k;
-        h += 0.03 * k;
+        // The leg lines are straight: a line that turns more is another one (an edge of the triangle, a contour).
+        h = (h + 0.03 * k).clamp(t - MAX_TURN, t + MAX_TURN);
         last = (x, y);
         gap = 0;
     }
@@ -451,7 +454,69 @@ fn find_start(ink: &Ink, c1: &Circle, c2: &Circle) -> Option<(f32, f32)> {
     }
     let (dx, dy) = (end.0 - c1.x, end.1 - c1.y);
     let d = dx.hypot(dy);
-    Some((end.0 + dx / d * c1.r, end.1 + dy / d * c1.r))
+    Some(triangle_centre(ink, c1, (dx / d, dy / d), d))
+}
+
+/// The line may go on past the triangle (along one of its sides): the triangle itself is where the ink is thickest
+/// along the line. `u` is the direction of the line from the circle, `reach` how far it was followed.
+fn triangle_centre(ink: &Ink, c1: &Circle, u: (f32, f32), reach: f32) -> (f32, f32) {
+    let r = c1.r;
+    let rad = 1.3 * r;
+    let reach_i = rad.ceil() as i64;
+    let mut best = (0, 2.0 * r);
+    let mut d = 2.0 * r;
+    while d <= reach + 0.5 * r {
+        let (cx, cy) = (c1.x + u.0 * d, c1.y + u.1 * d);
+        let mut n = 0;
+        for dy in -reach_i..=reach_i {
+            for dx in -reach_i..=reach_i {
+                if ((dx * dx + dy * dy) as f32) > rad * rad {
+                    continue;
+                }
+                let (x, y) = (cx + dx as f32, cy + dy as f32);
+                // Not the line itself.
+                let perp = ((x - c1.x) * -u.1 + (y - c1.y) * u.0).abs();
+                if perp > 3.0 && ink.at(x, y) > INK {
+                    n += 1;
+                }
+            }
+        }
+        if n > best.0 {
+            best = (n, d);
+        }
+        d += 1.0;
+    }
+    // The axis may pass along a side of the triangle: move to the middle of the ink around.
+    let (p0x, p0y) = (c1.x + u.0 * best.1, c1.y + u.1 * best.1);
+    let (mut px, mut py) = (p0x, p0y);
+    for _ in 0..4 {
+        let (mut sx, mut sy, mut n) = (0.0f32, 0.0f32, 0.0f32);
+        for dy in -reach_i..=reach_i {
+            for dx in -reach_i..=reach_i {
+                if ((dx * dx + dy * dy) as f32) > rad * rad {
+                    continue;
+                }
+                let (x, y) = (px + dx as f32, py + dy as f32);
+                let perp = ((x - c1.x) * -u.1 + (y - c1.y) * u.0).abs();
+                if perp > 3.0 && ink.at(x, y) > INK {
+                    sx += x;
+                    sy += y;
+                    n += 1.0;
+                }
+            }
+        }
+        if n < 1.0 {
+            break;
+        }
+        (px, py) = (sx / n, sy / n);
+        // Stay near the line: the neighbourhood may hold other printed things.
+        let (ex, ey) = (px - p0x, py - p0y);
+        let e = ex.hypot(ey);
+        if e > 0.7 * r {
+            (px, py) = (p0x + ex / e * 0.7 * r, p0y + ey / e * 0.7 * r);
+        }
+    }
+    (px, py)
 }
 
 /// Proposes a placement of the start, `n_controls` controls and the finish on the map.
@@ -483,7 +548,12 @@ pub fn scan(page: &PageImage) -> Scan {
     };
     let circles: Vec<Circle> = all
         .iter()
-        .filter(|c| c.score >= 0.6 && c.r >= 0.85 * median && c.r <= 1.3 * median)
+        .filter(|c| {
+            let size_ok = c.r >= 0.85 * median && c.r <= 1.3 * median;
+            // The finish may be a little smaller than the controls: its double ring is what tells it.
+            let finish_like = c.inner >= 0.7 && c.r >= 0.6 * median && c.r <= 1.3 * median;
+            c.score >= 0.6 && (size_ok || finish_like)
+        })
         .map(|c| Circle { x: (c.x + 0.5) * f, y: (c.y + 0.5) * f, r: c.r * f, ..c.clone() })
         .collect();
     let finish = (0..circles.len())

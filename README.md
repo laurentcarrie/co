@@ -13,6 +13,7 @@ Written in Rust with [egui](https://github.com/emilk/egui).
   English.
 - Zoom (mouse wheel) and pan (drag) on the map.
 - Select one leg: the view zooms on it, other legs can be faded or hidden.
+- **Exporter en PDF** saves the map with the legs drawn on it, next to the zip, as `<date>-<name>-export.pdf`.
 - Per-leg statistics: duration, run length, bird length (straight line between the
   controls), run / bird ratio, average pace.
 - Colour the selected leg by pace or by heart rate, with min and max sliders for the colour scale.
